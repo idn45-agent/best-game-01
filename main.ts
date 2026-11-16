@@ -1,46 +1,48 @@
-// STARFORGE — hand-in program for make.fun's best-game-01.
+// STARFORGE — best-game-01 entry program.
 //
-// The game itself is the static site in game/ (open game/index.html in a
-// browser and play; it needs no network and no build step). This program's
-// only job is delivery: copy game/ and screenshots/ into the output folder
-// and write dossier.json there with the kit's buildDossier, so the judge
-// reads exactly the files that were handed in.
+// What this does, and all it does: stage the game into the output directory
+// and summarise it for the judge. game/ (plain static files: index.html and
+// its ES modules, no library, no network) and screenshots/ are copied fresh
+// from beside this file, then dossier.json is written with buildDossier
+// from the vendored make.fun library, using the scorer's own caps. Run it
+// twice and the outputs are byte-identical: the dossier is a pure function
+// of the staged tree.
 //
-// Run it the way the grader does, with MAKEFUN_OUTPUT_DIR standing in for
-// /output outside the sandbox:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-// Two runs over the same repository produce byte-identical output: the copy
-// is a plain recursive copy of fixed files and buildDossier walks its tree
-// in sorted order.
+// (MAKEFUN_OUTPUT_DIR stands in for /output outside the grader.)
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const repoRoot = fileURLToPath(new URL('.', import.meta.url));
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const repoDir = fileURLToPath(new URL('.', import.meta.url));
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// The gate's caps, mirrored here so buildDossier refuses an oversized entry
-// at hand-in time instead of letting the scorer refuse it later.
-const DOSSIER_CAPS = {
+// Stage fresh: clear the two payload directories so a re-run can never
+// inherit a stale file from an older build of the game.
+mkdirSync(outDir, { recursive: true });
+for (const name of ['game', 'screenshots']) {
+  const target = join(outDir, name);
+  if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+}
+cpSync(join(repoDir, 'game'), join(outDir, 'game'), { recursive: true });
+if (existsSync(join(repoDir, 'screenshots'))) {
+  cpSync(join(repoDir, 'screenshots'), join(outDir, 'screenshots'), { recursive: true });
+}
+
+// Write the dossier with the scorer's caps (from the kit's gate reference):
+// the 160 KiB text cap shapes the bytes; the rest simply refuse anything
+// the scorer itself would refuse — more than 4 screenshots or one over
+// 256 KiB, more than 993 entries or 48 MiB under game/, or a game/ path
+// longer than 1000 bytes.
+const dossier = buildDossier(outDir, {
   text_max_bytes: 163840,
   screenshots: { max: 4, max_bytes: 262144 },
   game_max_files: 993,
   game_max_bytes: 50331648,
   game_path_max_bytes: 1000,
-};
+});
+writeFileSync(join(outDir, 'dossier.json'), dossier);
 
-function copyTree(from, to) {
-  mkdirSync(to, { recursive: true });
-  cpSync(from, to, { recursive: true });
-}
-
-mkdirSync(outputDir, { recursive: true });
-copyTree(join(repoRoot, 'game'), join(outputDir, 'game'));
-if (existsSync(join(repoRoot, 'screenshots'))) {
-  copyTree(join(repoRoot, 'screenshots'), join(outputDir, 'screenshots'));
-}
-
-const dossier = buildDossier(outputDir, DOSSIER_CAPS);
-writeFileSync(join(outputDir, 'dossier.json'), dossier);
+console.log(`STARFORGE staged to ${outDir} — dossier.json ${Buffer.byteLength(dossier)} bytes`);

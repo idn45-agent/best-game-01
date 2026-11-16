@@ -3,84 +3,38 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>STARFORGE — gravity is the weapon</title>
-<link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css">
+<title>STARFORGE — gravity is your weapon</title>
+<meta name="description" content="STARFORGE: a neon gravity-arena survival game. Catch asteroids in your orbit — your orbit is shield and ammo — chain nova kills, draft upgrades, and break the Devourer at wave 10.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='3' fill='%236ff7ff'/%3E%3Ccircle cx='8' cy='8' r='6.5' fill='none' stroke='%23ffc857' stroke-width='1.4'/%3E%3C/svg%3E">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #04060f;
+    height: 100%;
+    overflow: hidden;
+  }
+  body {
+    display: grid;
+    place-items: center;
+    background: radial-gradient(1200px 700px at 50% 42%, #0a1230 0%, #04060f 70%);
+  }
+  canvas#game {
+    display: block;
+    width: min(100vw, calc(100vh * 16 / 9));
+    height: auto;
+    aspect-ratio: 16 / 9;
+    background: #04060f;
+    box-shadow: 0 0 90px rgba(64, 160, 255, 0.22), 0 0 22px rgba(111, 247, 255, 0.12);
+    cursor: crosshair;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+</style>
 </head>
 <body>
-<div id="frame">
-  <canvas id="game" width="1280" height="720"></canvas>
-
-  <!-- Heads-up display: hull, wave, score, XP, nova cooldown, combo chain -->
-  <div id="hud" class="hidden">
-    <div id="hud-top">
-      <div class="hud-box" id="hud-hull-box">
-        <div class="hud-label">HULL</div>
-        <div class="bar" id="hud-hull-bar"><div class="bar-fill" id="hud-hull-fill"></div></div>
-        <div class="hud-value" id="hud-hull-text">100</div>
-      </div>
-      <div class="hud-box hud-center">
-        <div id="hud-wave">WAVE 1</div>
-        <div id="hud-left">HOSTILES 0</div>
-        <div id="bossbar" class="hidden">
-          <div class="hud-label">THE DEVOURER</div>
-          <div class="bar" id="hud-boss-bar"><div class="bar-fill" id="hud-boss-fill"></div></div>
-        </div>
-      </div>
-      <div class="hud-box hud-right">
-        <div class="hud-label">SCORE</div>
-        <div class="hud-value" id="hud-score">0</div>
-        <div id="hud-mute">SOUND ON</div>
-      </div>
-    </div>
-    <div id="combo" class="hidden">NOVA CHAIN ×2</div>
-    <div id="banner" class="hidden">WAVE 2</div>
-    <div id="hud-bottom">
-      <div class="hud-box">
-        <div class="hud-label">LEVEL <span id="hud-level">1</span></div>
-        <div class="bar" id="hud-xp-bar"><div class="bar-fill" id="hud-xp-fill"></div></div>
-      </div>
-      <div class="hud-box hud-right">
-        <div class="hud-label">ORBIT <span id="hud-orbit">0 / 5</span></div>
-        <div class="bar" id="hud-nova-bar"><div class="bar-fill" id="hud-nova-fill"></div></div>
-        <div id="hud-nova-label">NOVA CHARGING</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Title screen -->
-  <div id="ov-title" class="overlay">
-    <h1 id="game-title">STARFORGE</h1>
-    <p class="tagline">You are a newborn star. Your gravity is the weapon.</p>
-    <p class="howto">
-      Drift close to asteroids to capture them into <b>orbit</b> — they shield you and become ammo.<br>
-      <b>WASD / arrows</b> move &nbsp;·&nbsp; <b>Mouse</b> aim &nbsp;·&nbsp; <b>Click / Space</b> fling a rock<br>
-      <b>E / Shift</b> NOVA — blast every orbiting rock outward and chain the kills<br>
-      Survive to <b>wave 10</b> and destroy the final Devourer to ignite your star.
-    </p>
-    <p class="prompt">PRESS ENTER OR CLICK TO IGNITE</p>
-  </div>
-
-  <!-- Level-up choices -->
-  <div id="ov-upgrade" class="overlay hidden">
-    <h2>LEVEL UP — CHOOSE ONE</h2>
-    <div id="upg-cards"></div>
-  </div>
-
-  <!-- Pause -->
-  <div id="ov-pause" class="overlay hidden">
-    <h2>PAUSED</h2>
-    <p class="prompt">P TO RESUME</p>
-  </div>
-
-  <!-- Win / lose -->
-  <div id="ov-end" class="overlay hidden">
-    <h2 id="end-title">STAR IGNITED</h2>
-    <p id="end-sub" class="tagline"></p>
-    <div id="end-stats"></div>
-    <p class="prompt">PRESS R TO PLAY AGAIN</p>
-  </div>
-</div>
-<script type="module" src="js/main.js"></script>
+<canvas id="game" width="1280" height="720"></canvas>
+<script type="module" src="src/main.js"></script>
 </body>
 </html>
