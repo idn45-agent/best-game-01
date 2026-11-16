@@ -1,334 +1,372 @@
-// physics.js — movement, gravity and combat for STARFORGE.
-// The star's gravity well bends drifting asteroids in; close ones are
-// captured into orbit, where they shield the star and wait to be flung.
-// This module steps every actor and resolves every collision.
+// physics.js — all motion and contact in the arena: player thrust, asteroid
+// drift, the gravity well that captures rocks into orbit, orbit following,
+// flung-rock ballistics, hostile steering, shard magnetism, and every
+// circle-vs-circle collision. It reports events through callbacks on the game
+// object (onEnemyKilled, onPlayerHit, onShardCollected) so main.js owns the
+// rules and this file owns the movement.
 
-import { makeShard, spawnExplosion, spawnTrailSpark } from './entities.js';
+import { WORLD_W, WORLD_H, TAU, clamp, distance, angleTo } from './world.js';
 
-const ORBIT_RADIUS = 58;
+const FLUNG_SPEED = 980;
+const FLUNG_LIFE = 1.7;
+const CAPTURE_PULL = 165; // inward acceleration just outside the well
 
-function dist2(ax, ay, bx, by) {
-  const dx = ax - bx, dy = ay - by;
-  return dx * dx + dy * dy;
+export function orbitingRocks(game) {
+  return game.pools.rocks.filter((rock) => rock.mode === 'orbit');
 }
 
-export function stepPhysics(state, dt, control) {
-  const star = state.star;
-  star.pulse += dt * 2.4;
-  star.invulnTimer = Math.max(0, star.invulnTimer - dt);
-  star.novaTimer = Math.max(0, star.novaTimer - dt);
-  state.flingTimer = Math.max(0, state.flingTimer - dt);
+// --- player ---------------------------------------------------------------
 
-  moveStar(state, dt, control);
-  bendAsteroids(state, dt);
-  stepOrbit(state, dt);
-  if (control.fling && state.flingTimer <= 0) flingRocks(state, control);
-  if (control.nova) novaBlast(state);
-  stepProjectiles(state, dt);
-  stepEnemies(state, dt);
-  stepShards(state, dt);
-  stepParticles(state, dt);
-  collideOrbitWithEnemies(state);
-  collideEnemiesWithStar(state);
-}
-
-function moveStar(state, dt, control) {
-  const star = state.star;
+export function stepPlayer(game, intent, dt) {
+  const p = game.player;
   const accel = 1500;
-  star.vx += control.mx * accel * dt;
-  star.vy += control.my * accel * dt;
-  const drag = Math.pow(0.0015, dt);
-  star.vx *= drag; star.vy *= drag;
-  const sp = Math.hypot(star.vx, star.vy);
-  if (sp > star.speed) {
-    star.vx = (star.vx / sp) * star.speed;
-    star.vy = (star.vy / sp) * star.speed;
-  }
-  star.x += star.vx * dt;
-  star.y += star.vy * dt;
-  const m = star.radius + 4;
-  star.x = Math.min(state.width - m, Math.max(m, star.x));
-  star.y = Math.min(state.height - m, Math.max(m, star.y));
-  if (sp > 60 && state.rng() < 0.5) {
-    spawnTrailSpark(state, star.x - star.vx * 0.05, star.y - star.vy * 0.05, '#54f0ff');
-  }
-}
-
-// Gravity bends drifting asteroids toward the star; the Devourer bends
-// them toward itself and swallows what reaches it, stealing future ammo.
-function bendAsteroids(state, dt) {
-  const star = state.star;
-  const boss = state.enemies.find((e) => e.kind === 'devourer');
-  for (const a of state.asteroids) {
-    if (a.state !== 'drift') continue;
-    const dStar = Math.sqrt(dist2(a.x, a.y, star.x, star.y));
-    if (dStar < star.gravityRadius + 60) {
-      const pull = 260 * (1 - dStar / (star.gravityRadius + 140)) + 60;
-      a.vx += ((star.x - a.x) / (dStar || 1)) * pull * dt;
-      a.vy += ((star.y - a.y) / (dStar || 1)) * pull * dt;
-    }
-    if (boss) {
-      const dBoss = Math.sqrt(dist2(a.x, a.y, boss.x, boss.y));
-      if (dBoss < 210) {
-        a.vx += ((boss.x - a.x) / (dBoss || 1)) * 150 * dt;
-        a.vy += ((boss.y - a.y) / (dBoss || 1)) * 150 * dt;
-        if (dBoss < boss.radius + a.radius * 0.5) {
-          a.state = 'gone';
-          spawnExplosion(state, a.x, a.y, '#ff3860', 6, 90);
-        }
-      }
-    }
-    if (dStar < 80 && state.orbit.length < star.orbitCapacity) {
-      a.state = 'orbit';
-      a.orbitTime = 0;
-      a.orbitAngle = Math.atan2(a.y - star.y, a.x - star.x);
-      state.orbit.push(a);
-      state.audio.capture();
-      spawnExplosion(state, a.x, a.y, '#54f0ff', 5, 70);
-    }
-  }
-  state.asteroids = state.asteroids.filter((a) => a.state !== 'gone');
-}
-
-// Orbiting rocks ride a ring around the star, oldest at the front.
-function stepOrbit(state, dt) {
-  const star = state.star;
-  state.orbit = state.orbit.filter((a) => a.state === 'orbit');
-  state.orbit.forEach((a, i) => {
-    a.orbitTime += dt;
-    a.orbitAngle += dt * 1.7;
-    const wobble = Math.sin(state.time * 2 + i * 1.7) * 3;
-    a.x = star.x + Math.cos(a.orbitAngle) * (ORBIT_RADIUS + wobble);
-    a.y = star.y + Math.sin(a.orbitAngle) * (ORBIT_RADIUS + wobble);
-    a.angle += a.spin * dt;
-  });
-}
-
-function flingRocks(state, control) {
-  const star = state.star;
-  if (!state.orbit.length) return;
-  const n = Math.min(star.multiFling, state.orbit.length);
-  const aim = Math.atan2(control.aimY - star.y, control.aimX - star.x);
-  state.orbit.sort((a, b) => b.orbitTime - a.orbitTime);
-  for (let i = 0; i < n; i++) {
-    const rock = state.orbit.shift();
-    rock.state = 'shot';
-    const spread = (i - (n - 1) / 2) * 0.14;
-    const dir = aim + spread;
-    state.projectiles.push({
-      x: rock.x, y: rock.y,
-      vx: Math.cos(dir) * 760, vy: Math.sin(dir) * 760,
-      radius: rock.radius, verts: rock.verts,
-      angle: rock.angle, spin: rock.spin * 6,
-      damage: star.flingDamage, life: 1.5,
-    });
-  }
-  state.flingTimer = star.flingRate;
-  state.audio.fling();
-}
-
-function novaBlast(state) {
-  const star = state.star;
-  if (star.novaTimer > 0) return;
-  if (!state.orbit.length) { state.shake = Math.max(state.shake, 2); return; }
-  const rocks = state.orbit.splice(0, state.orbit.length);
-  for (const rock of rocks) {
-    const dir = Math.atan2(rock.y - star.y, rock.x - star.x);
-    state.projectiles.push({
-      x: rock.x, y: rock.y,
-      vx: Math.cos(dir) * 640, vy: Math.sin(dir) * 640,
-      radius: rock.radius, verts: rock.verts,
-      angle: rock.angle, spin: rock.spin * 6,
-      damage: star.novaDamage, life: 1.1,
-    });
-  }
-  for (const e of state.enemies) {
-    if (dist2(e.x, e.y, star.x, star.y) < 150 * 150) {
-      damageEnemy(state, e, star.novaDamage * 0.6);
-    }
-  }
-  state.shockwaves.push({ x: star.x, y: star.y, r: 10, maxR: star.novaRadius, life: 0.4, maxLife: 0.4 });
-  star.novaTimer = star.novaCooldownMax;
-  state.shake = Math.max(state.shake, 9);
-  state.audio.nova();
-}
-
-function stepProjectiles(state, dt) {
-  for (const p of state.projectiles) {
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.angle += p.spin * dt;
-    p.life -= dt;
-    for (const e of state.enemies) {
-      if (e.hp <= 0) continue;
-      const rr = p.radius + e.radius;
-      if (dist2(p.x, p.y, e.x, e.y) < rr * rr) {
-        damageEnemy(state, e, p.damage);
-        state.audio.hit();
-        p.life = 0;
-        break;
-      }
-    }
-  }
-  state.projectiles = state.projectiles.filter((p) =>
-    p.life > 0 && p.x > -60 && p.x < state.width + 60 && p.y > -60 && p.y < state.height + 60);
-}
-
-function stepEnemies(state, dt) {
-  const star = state.star;
-  for (const e of state.enemies) {
-    e.flash = Math.max(0, e.flash - dt);
-    e.wobble += dt * 3;
-    const dx = star.x - e.x, dy = star.y - e.y;
-    const d = Math.hypot(dx, dy) || 1;
-    let vx = (dx / d) * e.speed;
-    let vy = (dy / d) * e.speed;
-    if (e.kind === 'chaser' || e.kind === 'mini') {
-      vx += Math.cos(e.wobble) * 26;
-      vy += Math.sin(e.wobble * 1.3) * 26;
-    }
-    if (e.kind === 'dart') {
-      vx += Math.cos(e.wobble * 2.1) * 12;
-      vy += Math.sin(e.wobble * 2.1) * 46;
-    }
-    if (e.kind === 'devourer') {
-      e.dartTimer -= dt;
-      if (e.dartTimer <= 0 && state.enemies.length < 26) {
-        e.dartTimer = 3.2;
-        const a = state.rng() * Math.PI * 2;
-        state.enemies.push(state.spawnEnemy('dart',
-          e.x + Math.cos(a) * (e.radius + 18), e.y + Math.sin(a) * (e.radius + 18)));
-        spawnExplosion(state, e.x, e.y, '#ff7847', 6, 80);
-      }
-    }
-    e.x += vx * dt;
-    e.y += vy * dt;
-  }
-  state.enemies = state.enemies.filter((e) => e.hp > 0);
-}
-
-function stepShards(state, dt) {
-  const star = state.star;
-  for (const s of state.shards) {
-    s.life -= dt;
-    s.spin += dt * 4;
-    const d = Math.sqrt(dist2(s.x, s.y, star.x, star.y));
-    if (d < star.magnet) {
-      const pull = 620 * (1 - d / (star.magnet + 60)) + 120;
-      s.vx += ((star.x - s.x) / (d || 1)) * pull * dt;
-      s.vy += ((star.y - s.y) / (d || 1)) * pull * dt;
-    } else {
-      s.vx *= Math.pow(0.02, dt);
-      s.vy *= Math.pow(0.02, dt);
-    }
-    s.x += s.vx * dt;
-    s.y += s.vy * dt;
-    if (d < star.radius + 12) {
-      s.life = 0;
-      star.xp += s.value;
-      state.score += 10;
-      state.audio.pickup();
-      spawnExplosion(state, s.x, s.y, '#ffe066', 3, 50);
-      if (star.xp >= star.xpNext) state.levelReady = true;
-    }
-  }
-  state.shards = state.shards.filter((s) => s.life > 0);
-}
-
-function stepParticles(state, dt) {
-  for (const p of state.particles) {
-    p.life -= dt;
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
+  p.vx += intent.mx * accel * dt;
+  p.vy += intent.my * accel * dt;
+  // Drag tuned so top speed lands on p.speed for a full-strength input.
+  const drag = Math.pow(0.0018, dt);
+  if (intent.mx === 0) p.vx *= drag;
+  if (intent.my === 0) p.vy *= drag;
+  const speed = Math.hypot(p.vx, p.vy);
+  const top = p.speed * (Math.hypot(intent.mx, intent.my) > 0 ? 1 : 1.6);
+  if (speed > top && intent.mx === 0 && intent.my === 0) {
+    // coasting after a knockback: bleed down to cruise speed
     p.vx *= Math.pow(0.05, dt);
     p.vy *= Math.pow(0.05, dt);
+  } else if (speed > p.speed && (intent.mx !== 0 || intent.my !== 0)) {
+    p.vx = (p.vx / speed) * p.speed;
+    p.vy = (p.vy / speed) * p.speed;
   }
-  state.particles = state.particles.filter((p) => p.life > 0);
-  for (const f of state.floaters) {
-    f.life -= dt;
-    f.y -= 44 * dt;
-  }
-  state.floaters = state.floaters.filter((f) => f.life > 0);
-  for (const w of state.shockwaves) {
-    w.life -= dt;
-    w.r += (w.maxR - w.r) * Math.min(1, dt * 9);
-  }
-  state.shockwaves = state.shockwaves.filter((w) => w.life > 0);
+  p.x = clamp(p.x + p.vx * dt, p.r, WORLD_W - p.r);
+  p.y = clamp(p.y + p.vy * dt, p.r, WORLD_H - p.r);
+  p.pulse += dt * 2.4;
+  if (p.invuln > 0) p.invuln -= dt;
+  if (p.flingCd > 0) p.flingCd -= dt;
+  if (p.novaCd > 0) p.novaCd -= dt;
 }
 
-// An orbiting rock that touches a wraith destroys it and is spent:
-// the ring is a shield you must keep refilling from the asteroid field.
-function collideOrbitWithEnemies(state) {
-  for (const rock of [...state.orbit]) {
-    for (const e of state.enemies) {
-      if (e.hp <= 0) continue;
-      const rr = rock.radius + e.radius - 2;
-      if (dist2(rock.x, rock.y, e.x, e.y) < rr * rr) {
-        rock.state = 'gone';
-        state.orbit.splice(state.orbit.indexOf(rock), 1);
-        state.asteroids.splice(state.asteroids.indexOf(rock), 1);
-        damageEnemy(state, e, 70);
-        spawnExplosion(state, rock.x, rock.y, '#ffd9a0', 10, 130);
+// --- rocks ------------------------------------------------------------------
+
+function captureRock(game, rock) {
+  const p = game.player;
+  const orbit = orbitingRocks(game);
+  rock.mode = 'orbit';
+  rock.orbitAngle = angleTo(p.x, p.y, rock.x, rock.y);
+  rock.orbitRadius = 56 + (orbit.length % 3) * 17;
+  rock.orbitTime = 0;
+  rock.vx = 0;
+  rock.vy = 0;
+  game.onRockCaptured(rock);
+}
+
+export function stepRocks(game, dt) {
+  const p = game.player;
+  const rocks = game.pools.rocks;
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const rock = rocks[i];
+    rock.rot += rock.spin * dt;
+    if (rock.mode === 'drift') {
+      const d = distance(p.x, p.y, rock.x, rock.y);
+      if (d < p.gravity && orbitingRocks(game).length < p.orbitCap) {
+        captureRock(game, rock);
+      } else if (d < p.gravity + 48) {
+        // The well's fringe: a gentle inward tug so rocks stream toward it.
+        const a = angleTo(rock.x, rock.y, p.x, p.y);
+        rock.vx += Math.cos(a) * CAPTURE_PULL * dt;
+        rock.vy += Math.sin(a) * CAPTURE_PULL * dt;
+      }
+      rock.x += rock.vx * dt;
+      rock.y += rock.vy * dt;
+      // Soft-bounce off the arena walls so drifters stay in play.
+      if (rock.x < rock.r || rock.x > WORLD_W - rock.r) rock.vx *= -1;
+      if (rock.y < rock.r || rock.y > WORLD_H - rock.r) rock.vy *= -1;
+      rock.x = clamp(rock.x, rock.r, WORLD_W - rock.r);
+      rock.y = clamp(rock.y, rock.r, WORLD_H - rock.r);
+    } else if (rock.mode === 'orbit') {
+      rock.orbitTime += dt;
+      const angularSpeed = clamp(150 / rock.orbitRadius, 1.05, 2.6);
+      rock.orbitAngle += angularSpeed * dt;
+      rock.x = p.x + Math.cos(rock.orbitAngle) * rock.orbitRadius;
+      rock.y = p.y + Math.sin(rock.orbitAngle) * rock.orbitRadius;
+      rock.rot += dt * 1.4;
+    } else {
+      // flung: straight ballistic flight with a fading particle trail
+      rock.life += dt;
+      rock.x += rock.vx * dt;
+      rock.y += rock.vy * dt;
+      rock.rot += rock.spin * 4 * dt;
+      rock.trail.push({ x: rock.x, y: rock.y });
+      if (rock.trail.length > 14) rock.trail.shift();
+      if (rock.life > FLUNG_LIFE || rock.x < -30 || rock.x > WORLD_W + 30 || rock.y < -30 || rock.y > WORLD_H + 30) {
+        rocks.splice(i, 1);
+      }
+    }
+  }
+}
+
+// Launch the longest-orbiting rock (then the next, for multi-fling) toward a
+// point. Returns how many rocks were launched.
+export function flingRock(game, aimX, aimY) {
+  const p = game.player;
+  if (p.flingCd > 0) return 0;
+  const orbit = orbitingRocks(game).sort((a, b) => b.orbitTime - a.orbitTime);
+  if (orbit.length === 0) return 0;
+  const count = Math.min(p.multiFling, orbit.length);
+  const baseAngle = angleTo(p.x, p.y, aimX, aimY);
+  for (let i = 0; i < count; i++) {
+    const rock = orbit[i];
+    const spread = (i - (count - 1) / 2) * 0.13;
+    const a = baseAngle + spread;
+    rock.mode = 'flung';
+    rock.life = 0;
+    rock.trail = [];
+    rock.novaBorn = -99;
+    rock.vx = Math.cos(a) * FLUNG_SPEED;
+    rock.vy = Math.sin(a) * FLUNG_SPEED;
+  }
+  p.flingCd = 0.14;
+  game.onRockFlung(count);
+  return count;
+}
+
+// NOVA: every orbiting rock blasts radially outward at once. The kills those
+// rocks score inside the chain window are what combo.js multiplies.
+export function novaBlast(game) {
+  const p = game.player;
+  if (p.novaCd > 0) return 0;
+  const orbit = orbitingRocks(game);
+  if (orbit.length === 0) return 0;
+  for (const rock of orbit) {
+    rock.mode = 'flung';
+    rock.life = 0;
+    rock.trail = [];
+    rock.novaBorn = game.time;
+    rock.vx = Math.cos(rock.orbitAngle) * 840;
+    rock.vy = Math.sin(rock.orbitAngle) * 840;
+  }
+  p.novaCd = p.novaCdMax;
+  game.onNovaBlast(orbit.length);
+  return orbit.length;
+}
+
+// --- hostiles ---------------------------------------------------------------
+
+export function stepEnemies(game, dt) {
+  const p = game.player;
+  const enemies = game.pools.enemies;
+  for (const e of enemies) {
+    if (e.hitFlash > 0) e.hitFlash -= dt;
+    e.wobble += dt * 3;
+    let tx = p.x;
+    let ty = p.y;
+    if (e.type === 'devourer') {
+      // The maw drifts at the star and drags loose matter toward itself.
+      e.spawnT += dt;
+      pullMatterToward(game, e, dt);
+      if (e.spawnT > 6.5) {
+        e.spawnT = 0;
+        game.onDevourerSpawn(e);
+      }
+    }
+    const a = angleTo(e.x, e.y, tx, ty);
+    let steer = e.speed;
+    let vx = Math.cos(a) * steer;
+    let vy = Math.sin(a) * steer;
+    if (e.type === 'dart') {
+      const sway = Math.sin(e.wobble * 2.2) * 60;
+      vx += Math.cos(a + Math.PI / 2) * sway;
+      vy += Math.sin(a + Math.PI / 2) * sway;
+    }
+    if (e.type === 'splitter') {
+      vx *= 0.9 + Math.sin(e.wobble) * 0.1;
+      vy *= 0.9 + Math.cos(e.wobble) * 0.1;
+    }
+    e.vx = vx;
+    e.vy = vy;
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+    e.rot = a;
+    e.x = clamp(e.x, -60, WORLD_W + 60);
+    e.y = clamp(e.y, -60, WORLD_H + 60);
+  }
+  // Gentle separation so hostiles read as individuals, not a single blob.
+  for (let i = 0; i < enemies.length; i++) {
+    for (let j = i + 1; j < enemies.length; j++) {
+      const a = enemies[i];
+      const b = enemies[j];
+      const d = distance(a.x, a.y, b.x, b.y);
+      const min = a.r + b.r + 2;
+      if (d > 0 && d < min) {
+        const push = ((min - d) / min) * 26 * dt;
+        const ang = angleTo(b.x, b.y, a.x, a.y);
+        a.x += Math.cos(ang) * push;
+        a.y += Math.sin(ang) * push;
+        b.x -= Math.cos(ang) * push;
+        b.y -= Math.sin(ang) * push;
+      }
+    }
+  }
+}
+
+// The Devourer's gravity: loose rocks and the player star feel a slow drag
+// inside its reach. Orbiting rocks are locked to the star and immune.
+function pullMatterToward(game, boss, dt) {
+  const reach = 320;
+  for (const rock of game.pools.rocks) {
+    if (rock.mode !== 'drift') continue;
+    const d = distance(boss.x, boss.y, rock.x, rock.y);
+    if (d < reach && d > boss.r + rock.r) {
+      const a = angleTo(rock.x, rock.y, boss.x, boss.y);
+      rock.vx += Math.cos(a) * 95 * dt;
+      rock.vy += Math.sin(a) * 95 * dt;
+    }
+  }
+  const p = game.player;
+  const dp = distance(boss.x, boss.y, p.x, p.y);
+  if (dp < reach && dp > boss.r) {
+    const a = angleTo(p.x, p.y, boss.x, boss.y);
+    p.vx += Math.cos(a) * 58 * dt;
+    p.vy += Math.sin(a) * 58 * dt;
+  }
+}
+
+// --- shards -----------------------------------------------------------------
+
+export function stepShards(game, dt) {
+  const p = game.player;
+  const shards = game.pools.shards;
+  for (let i = shards.length - 1; i >= 0; i--) {
+    const s = shards[i];
+    s.life -= dt;
+    if (s.life <= 0) {
+      shards.splice(i, 1);
+      continue;
+    }
+    const d = distance(p.x, p.y, s.x, s.y);
+    if (d < p.magnet) {
+      const a = angleTo(s.x, s.y, p.x, p.y);
+      const pull = 560 * (1 - d / p.magnet) + 120;
+      s.vx += Math.cos(a) * pull * dt * 3;
+      s.vy += Math.sin(a) * pull * dt * 3;
+    }
+    s.vx *= Math.pow(0.12, dt);
+    s.vy *= Math.pow(0.12, dt);
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.rot += dt * 2.6;
+    if (d < p.r + s.r + 6) {
+      shards.splice(i, 1);
+      game.onShardCollected(s);
+    }
+  }
+}
+
+// --- particles and floaters ---------------------------------------------------
+
+export function stepEffects(game, dt) {
+  const particles = game.pools.particles;
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const fx = particles[i];
+    fx.life += dt;
+    if (fx.life >= fx.lifeMax) {
+      particles.splice(i, 1);
+      continue;
+    }
+    fx.x += fx.vx * dt;
+    fx.y += fx.vy * dt;
+    fx.vx *= Math.pow(0.02, dt);
+    fx.vy *= Math.pow(0.02, dt);
+    if (fx.type === 'ring') fx.r += 620 * dt;
+  }
+  const floaters = game.pools.floaters;
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.life += dt;
+    f.y -= 36 * dt;
+    if (f.life >= f.lifeMax) floaters.splice(i, 1);
+  }
+}
+
+// --- collisions ---------------------------------------------------------------
+
+function circlesTouch(ax, ay, ar, bx, by, br) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const rr = ar + br;
+  return dx * dx + dy * dy < rr * rr;
+}
+
+function damageEnemy(game, enemy, amount, cause, rock) {
+  enemy.hp -= amount;
+  enemy.hitFlash = 0.09;
+  if (enemy.hp <= 0) {
+    game.onEnemyKilled(enemy, cause, rock);
+  } else {
+    game.onEnemyHit(enemy, cause);
+  }
+}
+
+export function collide(game) {
+  const p = game.player;
+  const rocks = game.pools.rocks;
+  const enemies = game.pools.enemies;
+
+  // Flung rocks strike hostiles.
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const rock = rocks[i];
+    if (rock.mode !== 'flung') continue;
+    for (let j = enemies.length - 1; j >= 0; j--) {
+      const e = enemies[j];
+      if (circlesTouch(rock.x, rock.y, rock.r, e.x, e.y, e.r)) {
+        const wasNova = rock.novaBorn > 0 && game.time - rock.novaBorn < 2.5;
+        rocks.splice(i, 1);
+        damageEnemy(game, e, rock.damage + game.player.flingDamage - 1, wasNova ? 'nova' : 'fling', rock);
         break;
       }
     }
   }
-}
 
-// A wraith that reaches the star crashes into it. An orbiting rock
-// intercepts the crash; without one, the hull takes the damage.
-function collideEnemiesWithStar(state) {
-  const star = state.star;
-  for (const e of [...state.enemies]) {
-    if (e.hp <= 0) continue;
-    const rr = star.radius + e.radius - 2;
-    if (dist2(e.x, e.y, star.x, star.y) >= rr * rr) continue;
-    if (state.orbit.length) {
-      const rock = state.orbit.shift();
-      rock.state = 'gone';
-      state.asteroids.splice(state.asteroids.indexOf(rock), 1);
-      spawnExplosion(state, rock.x, rock.y, '#54f0ff', 12, 150);
-      damageEnemy(state, e, 9999);
-      state.shake = Math.max(state.shake, 4);
-    } else if (star.invulnTimer <= 0) {
-      star.hull -= e.damage;
-      star.invulnTimer = 0.9;
-      state.shake = Math.max(state.shake, 10);
-      state.audio.hurt();
-      damageEnemy(state, e, 9999);
-      state.floaters.push({ x: star.x, y: star.y - 30, text: `-${e.damage} HULL`, color: '#ff5470', life: 1, maxLife: 1 });
-      if (star.hull <= 0) {
-        star.hull = 0;
-        state.starDead = true;
+  // Orbiting rocks are a shield: a hostile that reaches one dies with it.
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const rock = rocks[i];
+    if (rock.mode !== 'orbit') continue;
+    for (let j = enemies.length - 1; j >= 0; j--) {
+      const e = enemies[j];
+      if (e.type === 'devourer') continue; // the maw is too big to stop this way
+      if (circlesTouch(rock.x, rock.y, rock.r + 2, e.x, e.y, e.r)) {
+        rocks.splice(i, 1);
+        game.onEnemyKilled(e, 'orbit', rock);
+        break;
       }
     }
   }
-}
 
-export function damageEnemy(state, e, dmg) {
-  if (e.hp <= 0) return;
-  e.hp -= dmg;
-  e.flash = 0.09;
-  if (dmg >= 25) {
-    state.floaters.push({
-      x: e.x + (state.rng() - 0.5) * 14, y: e.y - e.radius - 4,
-      text: String(Math.round(dmg)), color: '#ffffff', life: 0.6, maxLife: 0.6,
-    });
-  }
-  if (e.hp > 0) return;
-  state.kills += 1;
-  state.score += e.score;
-  spawnExplosion(state, e.x, e.y, e.color, e.kind === 'devourer' ? 60 : 16, e.kind === 'devourer' ? 320 : 200);
-  state.audio.explode();
-  for (let i = 0; i < e.xp; i++) state.shards.push(makeShard(e.x, e.y, state.rng));
-  if (e.kind === 'splitter') {
-    for (let i = 0; i < 2; i++) {
-      const m = state.spawnEnemy('mini', e.x + (i ? 16 : -16), e.y + (i ? -10 : 10));
-      state.enemies.push(m);
+  // Hostiles that reach the star bite it. The Devourer stays and keeps biting.
+  for (let j = enemies.length - 1; j >= 0; j--) {
+    const e = enemies[j];
+    if (!circlesTouch(p.x, p.y, p.r + 4, e.x, e.y, e.r)) continue;
+    if (e.type === 'devourer') {
+      if (p.invuln <= 0) game.onPlayerHit(e.damage, e);
+      const a = angleTo(e.x, e.y, p.x, p.y);
+      p.vx += Math.cos(a) * 320;
+      p.vy += Math.sin(a) * 320;
+    } else {
+      game.onEnemyKilled(e, 'ram', null);
+      if (p.invuln <= 0) game.onPlayerHit(e.damage, e);
     }
   }
-  if (e.kind === 'devourer') {
-    state.shake = Math.max(state.shake, 14);
-    if (state.finalBoss === e) state.bossDown = true;
+
+  // The Devourer eats loose asteroids to heal — deny it its food.
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const rock = rocks[i];
+    if (rock.mode !== 'drift') continue;
+    for (const e of enemies) {
+      if (e.type !== 'devourer') continue;
+      if (circlesTouch(rock.x, rock.y, rock.r, e.x, e.y, e.r - 6)) {
+        rocks.splice(i, 1);
+        e.hp = Math.min(e.hpMax, e.hp + 2);
+        game.onDevourerFed(e, rock);
+        break;
+      }
+    }
   }
 }

@@ -1,90 +1,174 @@
-// entities.js — factories for every actor in STARFORGE: the player star,
-// the void-wraith enemy kinds, XP shards, particles and floating text.
-// Pure data plus spawn helpers; movement and combat live in physics.js.
+// entities.js — factories for everything that exists in the arena: the player
+// star, asteroids (drifting, orbiting or flung), the four hostile kinds, XP
+// shards, particles and floating score text. Pure data plus base stats; all
+// behaviour lives in physics.js and main.js.
 
-export function makeStar(x, y) {
+import { WORLD_W, WORLD_H, TAU } from './world.js';
+
+let nextId = 1;
+
+export function resetEntityIds() {
+  nextId = 1;
+}
+
+// The newborn star. Every field an upgrade can touch starts at its base value
+// here, so upgrades.js reads like a list of deltas against this sheet.
+export function makePlayer() {
   return {
-    x, y, vx: 0, vy: 0,
-    radius: 16,
-    hull: 100, maxHull: 100,
-    speed: 268,
-    level: 1, xp: 0, xpNext: 6,
-    gravityRadius: 150,
-    orbitCapacity: 6,
-    flingDamage: 34,
-    flingRate: 0.20,
-    multiFling: 1,
-    novaCooldownMax: 9,
-    novaTimer: 0,
-    novaDamage: 95,
-    novaRadius: 250,
-    magnet: 130,
-    invulnTimer: 0,
+    kind: 'player',
+    x: WORLD_W / 2,
+    y: WORLD_H / 2,
+    vx: 0,
+    vy: 0,
+    r: 16,
+    hull: 100,
+    hullMax: 100,
+    speed: 238,
+    gravity: 128, // capture radius of the gravity well
+    orbitCap: 5, // how many rocks can orbit at once
+    flingDamage: 1,
+    multiFling: 1, // rocks launched per fling
+    novaCdMax: 9,
+    novaCd: 0,
+    magnet: 78, // shard attraction radius
+    level: 1,
+    xp: 0,
+    xpNext: 9,
+    invuln: 0,
+    flingCd: 0,
     pulse: 0,
   };
 }
 
-export const ENEMY_KINDS = {
-  chaser:   { radius: 14, hp: 42,  speed: 96,  damage: 12, xp: 1, score: 50,  color: '#ff3ea8' },
-  dart:     { radius: 9,  hp: 18,  speed: 178, damage: 8,  xp: 1, score: 80,  color: '#ff7847' },
-  splitter: { radius: 21, hp: 68,  speed: 68,  damage: 14, xp: 2, score: 120, color: '#b46bff' },
-  mini:     { radius: 9,  hp: 14,  speed: 138, damage: 7,  xp: 1, score: 40,  color: '#d98cff' },
-  devourer: { radius: 46, hp: 950, speed: 50,  damage: 22, xp: 25, score: 1500, color: '#ff3860' },
+// Asteroid sizes: bigger rocks are rarer, slower to arrive and hit harder.
+const ROCK_TIERS = [
+  { r: 9, damage: 1, weight: 5 },
+  { r: 12, damage: 2, weight: 3 },
+  { r: 15, damage: 3, weight: 1.4 },
+];
+
+export function makeRock(rng, x, y) {
+  const totalWeight = ROCK_TIERS.reduce((sum, t) => sum + t.weight, 0);
+  let roll = rng() * totalWeight;
+  let tier = ROCK_TIERS[0];
+  for (const t of ROCK_TIERS) {
+    roll -= t.weight;
+    if (roll <= 0) {
+      tier = t;
+      break;
+    }
+  }
+  const heading = rng.range(0, TAU);
+  const drift = rng.range(14, 40);
+  return {
+    id: nextId++,
+    kind: 'rock',
+    mode: 'drift', // drift -> orbit -> flung
+    x,
+    y,
+    vx: Math.cos(heading) * drift,
+    vy: Math.sin(heading) * drift,
+    r: tier.r,
+    damage: tier.damage,
+    rot: rng.range(0, TAU),
+    spin: rng.range(-0.7, 0.7),
+    sides: rng.int(6, 8),
+    jag: Array.from({ length: 8 }, () => rng.range(0.78, 1.18)),
+    orbitAngle: 0,
+    orbitRadius: 0,
+    orbitTime: 0,
+    novaBorn: -99,
+    life: 0,
+    trail: [],
+  };
+}
+
+const HOSTILE_STATS = {
+  chaser: { r: 13, hp: 2, speed: 96, damage: 9, score: 50, xp: 1 },
+  dart: { r: 7, hp: 1, speed: 196, damage: 6, score: 25, xp: 1 },
+  splitter: { r: 19, hp: 3, speed: 60, damage: 12, score: 80, xp: 2 },
+  devourer: { r: 47, hp: 55, speed: 37, damage: 20, score: 1500, xp: 10 },
 };
 
-export function makeEnemy(kind, x, y, hpScale = 1) {
-  const base = ENEMY_KINDS[kind];
+export function makeHostile(type, x, y, wave, rng) {
+  const base = HOSTILE_STATS[type];
+  const hpBonus = type === 'devourer' ? 0 : Math.floor(wave / 4);
+  const speedScale = Math.min(1.45, 1 + wave * 0.03);
   return {
-    kind, x, y, vx: 0, vy: 0,
-    radius: base.radius,
-    hp: Math.round(base.hp * hpScale),
-    maxHp: Math.round(base.hp * hpScale),
-    speed: base.speed,
+    id: nextId++,
+    kind: 'enemy',
+    type,
+    x,
+    y,
+    vx: 0,
+    vy: 0,
+    r: base.r,
+    hp: base.hp + hpBonus,
+    hpMax: base.hp + hpBonus,
+    speed: base.speed * speedScale,
     damage: base.damage,
-    xp: base.xp,
     score: base.score,
-    color: base.color,
-    wobble: Math.random() * Math.PI * 2,
-    flash: 0,
-    spawnTimer: 0,
-    dartTimer: 2.5,
+    xp: base.xp,
+    rot: 0,
+    wobble: rng ? rng.range(0, TAU) : 0,
+    bornAt: 0,
+    spawnT: 0, // devourer minion timer
+    hitFlash: 0,
   };
+}
+
+// The wave-10 Devourer is the same maw with a much deeper health pool.
+export function makeFinalDevourer(x, y) {
+  const boss = makeHostile('devourer', x, y, 10);
+  boss.hp = 125;
+  boss.hpMax = 125;
+  boss.speed = 42;
+  return boss;
 }
 
 export function makeShard(x, y, rng) {
+  const heading = rng.range(0, TAU);
+  const speed = rng.range(20, 70);
   return {
-    x, y, vx: (rng() - 0.5) * 60, vy: (rng() - 0.5) * 60,
-    radius: 5, value: 1, life: 14, spin: rng() * Math.PI * 2,
+    id: nextId++,
+    kind: 'shard',
+    x,
+    y,
+    vx: Math.cos(heading) * speed,
+    vy: Math.sin(heading) * speed,
+    r: 6,
+    rot: rng.range(0, TAU),
+    life: 14, // seconds before it fades
   };
 }
 
-export function makeParticle(x, y, vx, vy, life, size, color) {
-  return { x, y, vx, vy, life, maxLife: life, size, color };
+export function makeParticle(x, y, opts) {
+  return {
+    id: nextId++,
+    kind: 'particle',
+    type: opts.type || 'spark', // spark | ring | glow
+    x,
+    y,
+    vx: opts.vx || 0,
+    vy: opts.vy || 0,
+    r: opts.r || 3,
+    color: opts.color || '#ffd34d',
+    life: 0,
+    lifeMax: opts.lifeMax || 0.45,
+    width: opts.width || 3,
+  };
 }
 
-export function makeFloater(x, y, text, color) {
-  return { x, y, text, color, life: 0.9, maxLife: 0.9 };
-}
-
-// A radial burst of glowing debris; colours come from whatever died.
-export function spawnExplosion(state, x, y, color, count = 16, power = 190) {
-  for (let i = 0; i < count; i++) {
-    const a = state.rng() * Math.PI * 2;
-    const sp = 30 + state.rng() * power;
-    state.particles.push(makeParticle(
-      x, y,
-      Math.cos(a) * sp, Math.sin(a) * sp,
-      0.35 + state.rng() * 0.55,
-      1.5 + state.rng() * 2.6,
-      state.rng() < 0.3 ? '#ffffff' : color,
-    ));
-  }
-}
-
-export function spawnTrailSpark(state, x, y, color) {
-  state.particles.push(makeParticle(
-    x + (state.rng() - 0.5) * 10, y + (state.rng() - 0.5) * 10,
-    (state.rng() - 0.5) * 24, (state.rng() - 0.5) * 24,
-    0.3 + state.rng() * 0.3, 1.4 + state.rng() * 1.6, color,
-  ));
+export function makeFloater(x, y, text, color, size) {
+  return {
+    id: nextId++,
+    kind: 'floater',
+    x,
+    y,
+    text,
+    color: color || '#ffffff',
+    size: size || 20,
+    life: 0,
+    lifeMax: 1.15,
+  };
 }

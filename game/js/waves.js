@@ -1,87 +1,69 @@
-// waves.js — the wave director. Decides what the void sends at the star:
-// escalating packs of wraiths, a Devourer boss on waves 5 and 10, and a
-// short breather between waves. Wave 10's Devourer is the final one:
-// killing it ignites the star and wins the game.
+// waves.js — what each wave throws at the star, and the spawner that trickles
+// it in from the edges of the arena. Composition grows teeth as waves climb:
+// darts join at wave 2, splitters at wave 3, and a Devourer owns every fifth
+// wave. Wave 10's Devourer is the final one — kill it and the star ignites.
 
-import { makeEnemy } from './entities.js';
+import { makeHostile, makeFinalDevourer } from './entities.js';
+import { edgeSpawnPoint } from './world.js';
 
 export const FINAL_WAVE = 10;
 
-export function hpScaleFor(wave) {
-  return 1 + (wave - 1) * 0.16;
-}
-
-export function makeSpawnEnemy(state) {
-  return (kind, x, y) => makeEnemy(kind, x, y, hpScaleFor(state.wave));
-}
-
-function spawnPoint(state) {
-  const side = Math.floor(state.rng() * 4);
-  const m = 46;
-  if (side === 0) return { x: state.rng() * state.width, y: -m };
-  if (side === 1) return { x: state.width + m, y: state.rng() * state.height };
-  if (side === 2) return { x: state.rng() * state.width, y: state.height + m };
-  return { x: -m, y: state.rng() * state.height };
-}
-
-function compositionFor(wave) {
-  const list = [];
-  const chasers = 4 + wave * 2;
-  for (let i = 0; i < chasers; i++) list.push('chaser');
-  if (wave >= 2) for (let i = 0; i < 2 + wave; i++) list.push('dart');
-  if (wave >= 3) for (let i = 0; i < Math.floor(wave * 0.8); i++) list.push('splitter');
-  return list;
-}
-
-export function createDirector() {
+export function waveComposition(wave) {
+  if (wave % 5 === 0) {
+    // Boss waves: the Devourer plus a light escort that keeps pressure on.
+    return { devourer: 1, chaser: 4, dart: 3, splitter: 1 };
+  }
   return {
-    phase: 'announce', // announce -> spawning -> fighting -> breather
-    timer: 1.6,
-    queue: [],
-    bossSpawned: false,
+    devourer: 0,
+    chaser: 3 + wave,
+    dart: wave >= 2 ? 1 + wave : 0,
+    splitter: wave >= 3 ? Math.floor(wave / 2) : 0,
+  };
+}
 
-    update(state, dt) {
+export function waveSpawnInterval(wave) {
+  return Math.max(0.45, 1.15 - wave * 0.07);
+}
+
+export function waveTotal(comp) {
+  return comp.devourer + comp.chaser + comp.dart + comp.splitter;
+}
+
+// A shuffled spawn queue for one wave. next() deals one hostile at a time so
+// the arena fills at a fair pace instead of all at once.
+export function createSpawner(wave, rng) {
+  const comp = waveComposition(wave);
+  const queue = [];
+  if (comp.devourer > 0) queue.push(wave >= FINAL_WAVE ? 'final-devourer' : 'devourer');
+  for (let i = 0; i < comp.chaser; i++) queue.push('chaser');
+  for (let i = 0; i < comp.dart; i++) queue.push('dart');
+  for (let i = 0; i < comp.splitter; i++) queue.push('splitter');
+  // Shuffle everything behind the boss, so escorts arrive in mixed order.
+  for (let i = queue.length - 1; i > 1; i--) {
+    const j = 1 + Math.floor(rng() * i);
+    const tmp = queue[i];
+    queue[i] = queue[j];
+    queue[j] = tmp;
+  }
+  return {
+    wave,
+    total: queue.length,
+    remaining: queue.length,
+    interval: waveSpawnInterval(wave),
+    timer: 0.4, // first hostile arrives quickly
+    next(game, dt) {
+      if (this.remaining <= 0) return null;
       this.timer -= dt;
-      if (this.phase === 'announce') {
-        if (this.timer > 0) return;
-        this.queue = compositionFor(state.wave);
-        // Shuffle the pack so kinds arrive mixed.
-        for (let i = this.queue.length - 1; i > 0; i--) {
-          const j = Math.floor(state.rng() * (i + 1));
-          [this.queue[i], this.queue[j]] = [this.queue[j], this.queue[i]];
-        }
-        if (state.wave % 5 === 0) {
-          const p = spawnPoint(state);
-          const boss = makeEnemy('devourer', p.x, p.y, hpScaleFor(state.wave) * (state.wave >= 10 ? 1.7 : 1));
-          state.enemies.push(boss);
-          if (state.wave >= FINAL_WAVE) state.finalBoss = boss;
-          state.audio.roar();
-          state.shake = Math.max(state.shake, 8);
-          this.bossSpawned = true;
-        }
-        this.phase = 'spawning';
-        this.timer = 0;
-        return;
-      }
-      if (this.phase === 'spawning') {
-        if (this.timer <= 0 && this.queue.length) {
-          const kind = this.queue.shift();
-          const p = spawnPoint(state);
-          state.enemies.push(state.spawnEnemy(kind, p.x, p.y));
-          this.timer = Math.max(0.28, 0.9 - state.wave * 0.055);
-        }
-        if (!this.queue.length) this.phase = 'fighting';
-        return;
-      }
-      if (this.phase === 'fighting') {
-        if (!state.enemies.length) {
-          state.score += 100 * state.wave;
-          state.wave += 1;
-          this.bossSpawned = false;
-          this.phase = 'announce';
-          this.timer = 2.4;
-        }
-      }
+      if (this.timer > 0) return null;
+      this.timer = this.interval;
+      const type = queue[this.total - this.remaining];
+      this.remaining--;
+      const pt = edgeSpawnPoint(game.rng, 46);
+      if (type === 'final-devourer') return makeFinalDevourer(pt.x, pt.y);
+      return makeHostile(type, pt.x, pt.y, wave, rng);
+    },
+    done() {
+      return this.remaining <= 0;
     },
   };
 }

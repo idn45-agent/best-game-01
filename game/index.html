@@ -8,10 +8,79 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main id="stage">
+<div id="frame">
   <canvas id="game" width="1280" height="720"></canvas>
-  <p id="hint">WASD move &middot; mouse aim &middot; click / Space fling rock &middot; E nova &middot; P pause &middot; M mute</p>
-</main>
+
+  <!-- Heads-up display: hull, wave, score, XP, nova cooldown, combo chain -->
+  <div id="hud" class="hidden">
+    <div id="hud-top">
+      <div class="hud-box" id="hud-hull-box">
+        <div class="hud-label">HULL</div>
+        <div class="bar" id="hud-hull-bar"><div class="bar-fill" id="hud-hull-fill"></div></div>
+        <div class="hud-value" id="hud-hull-text">100</div>
+      </div>
+      <div class="hud-box hud-center">
+        <div id="hud-wave">WAVE 1</div>
+        <div id="hud-left">HOSTILES 0</div>
+        <div id="bossbar" class="hidden">
+          <div class="hud-label">THE DEVOURER</div>
+          <div class="bar" id="hud-boss-bar"><div class="bar-fill" id="hud-boss-fill"></div></div>
+        </div>
+      </div>
+      <div class="hud-box hud-right">
+        <div class="hud-label">SCORE</div>
+        <div class="hud-value" id="hud-score">0</div>
+        <div id="hud-mute">SOUND ON</div>
+      </div>
+    </div>
+    <div id="combo" class="hidden">NOVA CHAIN ×2</div>
+    <div id="banner" class="hidden">WAVE 2</div>
+    <div id="hud-bottom">
+      <div class="hud-box">
+        <div class="hud-label">LEVEL <span id="hud-level">1</span></div>
+        <div class="bar" id="hud-xp-bar"><div class="bar-fill" id="hud-xp-fill"></div></div>
+      </div>
+      <div class="hud-box hud-right">
+        <div class="hud-label">ORBIT <span id="hud-orbit">0 / 5</span></div>
+        <div class="bar" id="hud-nova-bar"><div class="bar-fill" id="hud-nova-fill"></div></div>
+        <div id="hud-nova-label">NOVA CHARGING</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Title screen -->
+  <div id="ov-title" class="overlay">
+    <h1 id="game-title">STARFORGE</h1>
+    <p class="tagline">You are a newborn star. Your gravity is the weapon.</p>
+    <p class="howto">
+      Drift close to asteroids to capture them into <b>orbit</b> — they shield you and become ammo.<br>
+      <b>WASD / arrows</b> move &nbsp;·&nbsp; <b>Mouse</b> aim &nbsp;·&nbsp; <b>Click / Space</b> fling a rock<br>
+      <b>E / Shift</b> NOVA — blast every orbiting rock outward and chain the kills<br>
+      Survive to <b>wave 10</b> and destroy the final Devourer to ignite your star.
+    </p>
+    <p class="prompt">PRESS ENTER OR CLICK TO IGNITE</p>
+  </div>
+
+  <!-- Level-up choices -->
+  <div id="ov-upgrade" class="overlay hidden">
+    <h2>LEVEL UP — CHOOSE ONE</h2>
+    <div id="upg-cards"></div>
+  </div>
+
+  <!-- Pause -->
+  <div id="ov-pause" class="overlay hidden">
+    <h2>PAUSED</h2>
+    <p class="prompt">P TO RESUME</p>
+  </div>
+
+  <!-- Win / lose -->
+  <div id="ov-end" class="overlay hidden">
+    <h2 id="end-title">STAR IGNITED</h2>
+    <p id="end-sub" class="tagline"></p>
+    <div id="end-stats"></div>
+    <p class="prompt">PRESS R TO PLAY AGAIN</p>
+  </div>
+</div>
 <script type="module" src="js/main.js"></script>
 </body>
 </html>

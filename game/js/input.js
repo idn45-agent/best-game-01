@@ -1,50 +1,108 @@
-// input.js — keyboard and mouse state for STARFORGE.
-// Keeps a held-key set for movement, a per-frame pressed set for one-shot
-// actions (fling, nova, pause), and the mouse position in canvas pixels.
+// input.js — keyboard and mouse, translated into game intent. Held keys give
+// a movement vector; discrete presses (fling, nova, pause, mute, start,
+// restart) are queued as one-shot actions that main.js drains each frame, so
+// a press is never lost between frames and never fires twice.
+
+import { WORLD_W, WORLD_H, clamp } from './world.js';
+
+const MOVE_KEYS = {
+  KeyW: 'up', ArrowUp: 'up',
+  KeyS: 'down', ArrowDown: 'down',
+  KeyA: 'left', ArrowLeft: 'left',
+  KeyD: 'right', ArrowRight: 'right',
+};
 
 export function createInput(canvas) {
   const held = new Set();
-  const pressed = new Set();
-  const mouse = { x: 640, y: 300, down: false, clicked: false };
+  const queue = [];
+  const mouse = { x: WORLD_W / 2, y: WORLD_H / 3, down: false };
 
-  function toCanvas(evt) {
+  function toWorld(event) {
     const rect = canvas.getBoundingClientRect();
     return {
-      x: (evt.clientX - rect.left) * (canvas.width / rect.width),
-      y: (evt.clientY - rect.top) * (canvas.height / rect.height),
+      x: clamp(((event.clientX - rect.left) / rect.width) * WORLD_W, 0, WORLD_W),
+      y: clamp(((event.clientY - rect.top) / rect.height) * WORLD_H, 0, WORLD_H),
     };
   }
 
-  window.addEventListener('keydown', (evt) => {
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(evt.code)) {
-      evt.preventDefault();
+  window.addEventListener('keydown', (event) => {
+    if (MOVE_KEYS[event.code]) {
+      held.add(MOVE_KEYS[event.code]);
+      event.preventDefault();
+      return;
     }
-    if (!evt.repeat) pressed.add(evt.code);
-    held.add(evt.code);
+    if (event.repeat) return;
+    switch (event.code) {
+      case 'Space':
+        queue.push('fling');
+        queue.push('start');
+        event.preventDefault();
+        break;
+      case 'KeyE':
+      case 'ShiftLeft':
+      case 'ShiftRight':
+        queue.push('nova');
+        break;
+      case 'KeyP':
+      case 'Escape':
+        queue.push('pause');
+        break;
+      case 'KeyM':
+        queue.push('mute');
+        break;
+      case 'Enter':
+        queue.push('start');
+        break;
+      case 'KeyR':
+        queue.push('restart');
+        break;
+      default:
+        break;
+    }
   });
-  window.addEventListener('keyup', (evt) => held.delete(evt.code));
-  window.addEventListener('blur', () => { held.clear(); mouse.down = false; });
 
-  canvas.addEventListener('mousemove', (evt) => {
-    const p = toCanvas(evt);
-    mouse.x = p.x; mouse.y = p.y;
+  window.addEventListener('keyup', (event) => {
+    if (MOVE_KEYS[event.code]) held.delete(MOVE_KEYS[event.code]);
   });
-  canvas.addEventListener('mousedown', (evt) => {
-    const p = toCanvas(evt);
-    mouse.x = p.x; mouse.y = p.y;
+
+  canvas.addEventListener('mousemove', (event) => {
+    const pt = toWorld(event);
+    mouse.x = pt.x;
+    mouse.y = pt.y;
+  });
+
+  canvas.addEventListener('mousedown', (event) => {
+    const pt = toWorld(event);
+    mouse.x = pt.x;
+    mouse.y = pt.y;
     mouse.down = true;
-    mouse.clicked = true;
+    queue.push('fling');
+    queue.push('start');
   });
-  window.addEventListener('mouseup', () => { mouse.down = false; });
+
+  window.addEventListener('mouseup', () => {
+    mouse.down = false;
+  });
+
+  canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
   return {
     mouse,
-    isDown: (...codes) => codes.some((c) => held.has(c)),
-    wasPressed: (code) => pressed.has(code),
-    // Called once at the end of each frame by the game loop.
-    endFrame() {
-      pressed.clear();
-      mouse.clicked = false;
+    // Movement vector in [-1, 1] on each axis, normalized by the caller.
+    moveVector() {
+      let mx = 0;
+      let my = 0;
+      if (held.has('left')) mx -= 1;
+      if (held.has('right')) mx += 1;
+      if (held.has('up')) my -= 1;
+      if (held.has('down')) my += 1;
+      return { mx, my };
+    },
+    // One-shot actions pressed since the last drain.
+    drainActions() {
+      const out = queue.slice();
+      queue.length = 0;
+      return out;
     },
   };
 }

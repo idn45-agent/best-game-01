@@ -1,349 +1,596 @@
-// main.js — STARFORGE boot and game loop.
-// Owns the shared game state, the mode machine (title, playing, levelup,
-// paused, won, lost), the demo autopilot used for screenshots, and the
-// staged scenes the ?shot= parameter asks for.
+// main.js — STARFORGE's conductor: owns the game state machine (title,
+// playing, upgrade draft, paused, won, lost), the fixed-step loop, wave flow,
+// scoring, and every event callback physics.js reports (kills, captures,
+// hits, shards). It also runs the demo autopilot (?demo=1) and the frozen
+// screenshot scenes (?shot=title|play|boss|over) the entry's images come from.
+//
+// STARFORGE: you are a newborn star. Capture asteroids into orbit with your
+// gravity well — they shield you and become ammo. Fling them at the void,
+// nova them outward to chain kills, draft upgrades, and destroy the final
+// Devourer on wave 10 to ignite.
 
+import { WORLD_W, WORLD_H, TAU, clamp, distance, angleTo, makeRng, createStarfield, createPools, edgeSpawnPoint } from './world.js';
+import { resetEntityIds, makePlayer, makeRock, makeHostile, makeShard, makeParticle, makeFloater } from './entities.js';
+import { stepPlayer, stepRocks, stepEnemies, stepShards, stepEffects, collide, flingRock, novaBlast, orbitingRocks } from './physics.js';
+import { createSpawner, FINAL_WAVE } from './waves.js';
+import { rollUpgrades } from './upgrades.js';
+import { NovaChain } from './combo.js';
+import { createRenderer } from './render.js';
+import { createHud } from './hud.js';
 import { createInput } from './input.js';
-import { createAudio } from './audio.js';
-import { createRng, createBackdrop, makeAsteroid, maintainAsteroids } from './world.js';
-import { makeStar, makeEnemy, spawnExplosion } from './entities.js';
-import { stepPhysics } from './physics.js';
-import { createDirector, makeSpawnEnemy } from './waves.js';
-import { rollChoices } from './upgrades.js';
-import { drawScene } from './render.js';
-import {
-  drawHud, drawTitleScreen, drawLevelUpScreen,
-  drawPausedOverlay, drawEndScreen, drawWaveBanner, upgradeCardRects,
-} from './hud.js';
+import { createSoundBank } from './audio.js';
 
-const WIDTH = 1280;
-const HEIGHT = 720;
+const STEP = 1 / 60;
+const AMBIENT_ROCK_TARGET = 9;
 
 const params = new URLSearchParams(window.location.search);
-const seed = Number(params.get('seed') ?? 7) || 7;
-const demo = params.get('demo') === '1';
-const shot = params.get('shot');
+const seed = Number.parseInt(params.get('seed') || '20261116', 10) || 20261116;
+const demoMode = params.get('demo') === '1';
+const shotMode = params.get('shot');
 
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+const renderer = createRenderer(canvas);
+const hud = createHud();
 const input = createInput(canvas);
-const audio = createAudio();
+const sound = createSoundBank();
 
-window.__shotReady = false;
+const game = {
+  state: 'title',
+  time: 0,
+  score: 0,
+  kills: 0,
+  wave: 1,
+  rng: makeRng(seed),
+  field: null,
+  pools: createPools(),
+  player: null,
+  spawner: null,
+  combo: new NovaChain(),
+  shake: 0,
+  aimX: WORLD_W * 0.7,
+  aimY: WORLD_H * 0.35,
+  backdropRocks: [],
+  frozen: false,
+  demo: demoMode,
+  clearT: 0,
+  wavePhase: 'active',
+  rockSpawnT: 0,
+  autoFlingT: 0,
+  autoPickT: 0,
+  pendingChoices: null,
+  sfxT: {},
+};
+game.field = createStarfield(game.rng);
 
-function createState() {
-  const rng = createRng(seed);
-  const state = {
-    width: WIDTH, height: HEIGHT,
-    time: 0, rng, audio,
-    backdrop: createBackdrop(rng, WIDTH, HEIGHT),
-    star: makeStar(WIDTH / 2, HEIGHT / 2),
-    asteroids: [], orbit: [], projectiles: [], enemies: [],
-    shards: [], particles: [], floaters: [], shockwaves: [],
-    score: 0, kills: 0, wave: 1,
-    director: createDirector(),
-    mode: 'title',
-    aim: { aimX: WIDTH / 2 + 200, aimY: HEIGHT / 2 - 80 },
-    flingTimer: 0, asteroidTimer: 0, shake: 0,
-    choices: [], levelReady: false,
-    starDead: false, starHidden: false, deathTimer: 0,
-    bossDown: false, finalBoss: null,
-    demo, endAt: 0,
-  };
-  state.spawnEnemy = makeSpawnEnemy(state);
-  return state;
+// Decorative orbit for the title screen emblem.
+for (let i = 0; i < 5; i++) {
+  game.backdropRocks.push({
+    angle: (i / 5) * TAU + 0.4,
+    orbitRadius: 56 + (i % 3) * 17,
+    r: 9 + (i % 3) * 3,
+  });
+}
+// A few still drifters behind the title text.
+for (let i = 0; i < 6; i++) {
+  const rock = makeRock(game.rng, game.rng.range(60, WORLD_W - 60), game.rng.range(60, WORLD_H - 60));
+  rock.vx = 0;
+  rock.vy = 0;
+  game.pools.rocks.push(rock);
 }
 
-let state = createState();
+// --- small helpers ----------------------------------------------------------
 
-function resetGame() {
-  const fresh = createState();
-  fresh.demo = state.demo;
-  state = fresh;
-  state.mode = 'playing';
-  // A few asteroids already drifting inside the field, ready to catch.
-  for (let i = 0; i < 6; i++) {
-    const a = makeAsteroid(state.rng, WIDTH, HEIGHT);
-    a.x = 120 + state.rng() * (WIDTH - 240);
-    a.y = 100 + state.rng() * (HEIGHT - 200);
-    state.asteroids.push(a);
-  }
+function sfxReady(key, gap) {
+  const last = game.sfxT[key] || -9;
+  if (game.time - last < gap) return false;
+  game.sfxT[key] = game.time;
+  return true;
 }
 
-// --- staged scenes for screenshots (?shot=...) --------------------------
-
-function giveOrbitRocks(count) {
+function burst(x, y, color, count, speed = 260, lifeMax = 0.5) {
   for (let i = 0; i < count; i++) {
-    const a = makeAsteroid(state.rng, WIDTH, HEIGHT);
-    a.state = 'orbit';
-    a.orbitTime = 2 + i * 0.7;
-    a.orbitAngle = (i / count) * Math.PI * 2;
-    a.x = state.star.x + Math.cos(a.orbitAngle) * 58;
-    a.y = state.star.y + Math.sin(a.orbitAngle) * 58;
-    state.asteroids.push(a);
-    state.orbit.push(a);
+    const a = game.rng.range(0, TAU);
+    const v = game.rng.range(speed * 0.25, speed);
+    game.pools.particles.push(makeParticle(x, y, {
+      vx: Math.cos(a) * v,
+      vy: Math.sin(a) * v,
+      r: game.rng.range(1.6, 3.6),
+      color,
+      lifeMax: game.rng.range(lifeMax * 0.5, lifeMax),
+    }));
   }
 }
 
-function stagePlay() {
-  resetGame();
-  state.wave = 3;
-  state.director.phase = 'fighting';
-  state.score = 1250;
-  state.kills = 17;
-  state.star.hull = 78;
-  state.star.xp = 3;
-  giveOrbitRocks(6);
-  const spots = [[880, 210], [1010, 430], [820, 520], [300, 180], [240, 480]];
-  const kinds = ['chaser', 'splitter', 'chaser', 'dart', 'chaser'];
-  kinds.forEach((kind, i) => {
-    state.enemies.push(state.spawnEnemy(kind, spots[i][0], spots[i][1]));
-  });
-  for (let i = 0; i < 7; i++) {
-    state.shards.push({
-      x: 420 + state.rng() * 260, y: 260 + state.rng() * 200,
-      vx: 0, vy: 0, radius: 5, value: 1, life: 14, spin: state.rng() * 3,
-    });
-  }
+function ringFx(x, y, color, width = 4, lifeMax = 0.45) {
+  game.pools.particles.push(makeParticle(x, y, { type: 'ring', r: 14, color, width, lifeMax }));
 }
 
-function stageBoss() {
-  resetGame();
-  state.wave = 5;
-  state.director.phase = 'fighting';
-  state.score = 4920;
-  state.kills = 74;
-  state.star.level = 4;
-  state.star.hull = 64;
-  state.star.novaTimer = 5; // let the staged ring read before the autopilot novas
-  giveOrbitRocks(6);
-  const boss = makeEnemy('devourer', 930, 300, 1.3);
-  boss.hp = Math.round(boss.maxHp * 0.55);
-  state.enemies.push(boss);
-  state.enemies.push(state.spawnEnemy('chaser', 240, 160));
-  state.enemies.push(state.spawnEnemy('dart', 300, 560));
+function floater(x, y, text, color, size) {
+  game.pools.floaters.push(makeFloater(x, y, text, color, size));
 }
 
-function stageOver() {
-  resetGame();
-  state.mode = 'lost';
-  state.score = 8640;
-  state.wave = 7;
-  state.kills = 132;
-  state.star.level = 6;
-  state.time = 342;
-  state.starHidden = true;
-  spawnExplosion(state, state.star.x, state.star.y, '#54f0ff', 40, 300);
+function removeEnemy(enemy) {
+  const idx = game.pools.enemies.findIndex((e) => e.id === enemy.id);
+  if (idx >= 0) game.pools.enemies.splice(idx, 1);
 }
 
-function stageTitle() {
-  resetGame();
-  state.mode = 'title';
-  giveOrbitRocks(4);
+function enemyColor(type) {
+  return { chaser: '#ff4d6d', dart: '#ff7847', splitter: '#b46bff', devourer: '#c44dff' }[type] || '#ffffff';
 }
 
-if (shot === 'title') stageTitle();
-else if (shot === 'play') stagePlay();
-else if (shot === 'boss') stageBoss();
-else if (shot === 'over') stageOver();
-else if (demo) resetGame();
+// --- physics event callbacks --------------------------------------------------
 
-// --- control: human input, or the demo autopilot -------------------------
+game.onRockCaptured = (rock) => {
+  ringFx(rock.x, rock.y, 'rgba(255, 210, 120, 0.9)', 3, 0.3);
+  burst(rock.x, rock.y, '#ffd34d', 5, 150, 0.3);
+  if (sfxReady('capture', 0.06)) sound.capture();
+};
 
-function playerControl() {
-  const mx = (input.isDown('KeyD', 'ArrowRight') ? 1 : 0) - (input.isDown('KeyA', 'ArrowLeft') ? 1 : 0);
-  const my = (input.isDown('KeyS', 'ArrowDown') ? 1 : 0) - (input.isDown('KeyW', 'ArrowUp') ? 1 : 0);
-  return {
-    mx, my,
-    fling: input.mouse.down || input.isDown('Space'),
-    nova: input.wasPressed('KeyE') || input.wasPressed('ShiftLeft') || input.wasPressed('ShiftRight'),
-    aimX: input.mouse.x, aimY: input.mouse.y,
-  };
-}
+game.onRockFlung = () => {
+  if (sfxReady('fling', 0.05)) sound.fling();
+};
 
-function autopilotControl() {
-  const star = state.star;
-  let threat = null, threatDist = Infinity;
-  for (const e of state.enemies) {
-    const d = Math.hypot(e.x - star.x, e.y - star.y);
-    if (d < threatDist) { threatDist = d; threat = e; }
+game.onNovaBlast = (count) => {
+  game.combo.beginNova(game.time);
+  game.shake = Math.max(game.shake, 13);
+  ringFx(game.player.x, game.player.y, 'rgba(255, 120, 220, 0.95)', 7, 0.55);
+  game.pools.particles.push(makeParticle(game.player.x, game.player.y, {
+    type: 'glow', r: 120, color: 'rgba(255, 120, 220, 0.35)', lifeMax: 0.35,
+  }));
+  floater(game.player.x, game.player.y - 44, 'NOVA!', '#ff9ff0', 30);
+  sound.nova();
+};
+
+game.onEnemyHit = (enemy) => {
+  burst(enemy.x, enemy.y, '#ffffff', 3, 180, 0.25);
+  if (sfxReady('hit', 0.05)) sound.hit();
+};
+
+game.onEnemyKilled = (enemy, cause, rock) => {
+  removeEnemy(enemy);
+  game.kills++;
+  let multiplier = 1;
+  if (cause === 'nova') {
+    multiplier = game.combo.registerKill(game.time);
+    if (multiplier > 1 && sfxReady('chain', 0.05)) sound.chain(multiplier);
   }
-  let goal = null, goalDist = Infinity;
-  for (const s of state.shards) {
-    const d = Math.hypot(s.x - star.x, s.y - star.y);
-    if (d < goalDist) { goalDist = d; goal = s; }
+  const gained = enemy.score * multiplier;
+  game.score += gained;
+  burst(enemy.x, enemy.y, enemyColor(enemy.type), enemy.type === 'devourer' ? 42 : 12, 320, 0.6);
+  game.pools.particles.push(makeParticle(enemy.x, enemy.y, {
+    type: 'glow', r: enemy.r * 2.2, color: 'rgba(255,255,255,0.25)', lifeMax: 0.3,
+  }));
+  floater(enemy.x, enemy.y - 10, multiplier > 1 ? `+${gained} ×${multiplier}` : `+${gained}`, multiplier > 1 ? '#ffe259' : '#ffffff', multiplier > 1 ? 26 : 19);
+  if (sfxReady('die', 0.05)) sound.die();
+  for (let i = 0; i < enemy.xp; i++) {
+    game.pools.shards.push(makeShard(enemy.x, enemy.y, game.rng));
   }
-  if (!goal) {
-    for (const a of state.asteroids) {
-      if (a.state !== 'drift') continue;
-      const d = Math.hypot(a.x - star.x, a.y - star.y);
-      if (d < goalDist) { goalDist = d; goal = a; }
-    }
-  }
-  let mx = 0, my = 0;
-  if (goal) { mx += (goal.x - star.x) / (goalDist || 1); my += (goal.y - star.y) / (goalDist || 1); }
-  if (threat && threatDist < 200) {
-    mx += ((star.x - threat.x) / threatDist) * 1.6;
-    my += ((star.y - threat.y) / threatDist) * 1.6;
-  }
-  if (star.x < 130) mx += 1.2; else if (star.x > WIDTH - 130) mx -= 1.2;
-  if (star.y < 120) my += 1.2; else if (star.y > HEIGHT - 120) my -= 1.2;
-  const len = Math.hypot(mx, my);
-  if (len > 1) { mx /= len; my /= len; }
-  let near = 0;
-  for (const e of state.enemies) {
-    if (Math.hypot(e.x - star.x, e.y - star.y) < 185) near++;
-  }
-  return {
-    mx, my,
-    fling: Boolean(threat && threatDist < 560 && state.orbit.length > 0),
-    nova: near >= 3 && state.orbit.length >= 3 && star.novaTimer <= 0,
-    aimX: threat ? threat.x : star.x + 220,
-    aimY: threat ? threat.y : star.y - 60,
-  };
-}
-
-// --- mode machine ---------------------------------------------------------
-
-function enterLevelUp() {
-  const star = state.star;
-  star.level += 1;
-  star.xp -= star.xpNext;
-  star.xpNext = 6 + (star.level - 1) * 5;
-  state.choices = rollChoices(state.rng);
-  state.mode = 'levelup';
-  state.levelTimer = 0.8;
-  audio.levelup();
-}
-
-function chooseUpgrade(i) {
-  const choice = state.choices[i];
-  if (!choice) return;
-  choice.apply(state.star);
-  state.floaters.push({
-    x: state.star.x, y: state.star.y - 44,
-    text: choice.name.toUpperCase(), color: choice.color, life: 1.1, maxLife: 1.1,
-  });
-  if (state.star.xp >= state.star.xpNext) {
-    enterLevelUp();
-  } else {
-    state.mode = 'playing';
-  }
-}
-
-function update(dt) {
-  state.time += dt;
-  state.shake = Math.max(0, state.shake - dt * 30);
-  if (input.wasPressed('KeyM')) audio.toggleMute();
-  if (input.mouse.clicked) audio.unlock();
-
-  if (state.mode === 'title') {
-    maintainAsteroids(state, dt);
-    stepPhysics(state, dt, { mx: 0, my: 0, fling: false, nova: false, aimX: 0, aimY: 0 });
-    if (input.mouse.clicked || input.wasPressed('Enter')) {
-      audio.unlock();
-      resetGame();
-    }
-    return;
-  }
-
-  if (state.mode === 'levelup') {
-    if (state.demo) {
-      state.levelTimer -= dt;
-      if (state.levelTimer <= 0) chooseUpgrade(Math.floor(state.rng() * state.choices.length));
-      return;
-    }
+  if (enemy.type === 'splitter') {
     for (let i = 0; i < 3; i++) {
-      if (input.wasPressed(`Digit${i + 1}`)) chooseUpgrade(i);
+      const dart = makeHostile('dart', enemy.x, enemy.y, game.wave, game.rng);
+      const a = (i / 3) * TAU + game.rng.range(0, 1);
+      dart.x += Math.cos(a) * 14;
+      dart.y += Math.sin(a) * 14;
+      game.pools.enemies.push(dart);
     }
-    if (input.mouse.clicked) {
-      const rects = upgradeCardRects(state);
-      rects.forEach((r, i) => {
-        const m = input.mouse;
-        if (m.x >= r.x && m.x <= r.x + r.w && m.y >= r.y && m.y <= r.y + r.h) chooseUpgrade(i);
-      });
+  }
+  if (enemy.type === 'devourer') {
+    game.shake = Math.max(game.shake, 16);
+    if (game.wave >= FINAL_WAVE) {
+      winGame();
+    } else {
+      floater(enemy.x, enemy.y - 30, 'DEVOURER DOWN', '#ff9ff0', 30);
+    }
+  }
+};
+
+game.onPlayerHit = (damage) => {
+  const p = game.player;
+  p.hull -= damage;
+  p.invuln = 0.45;
+  game.shake = Math.max(game.shake, 7);
+  burst(p.x, p.y, '#ff5c5c', 10, 280, 0.45);
+  sound.hurt();
+  if (p.hull <= 0) {
+    p.hull = 0;
+    loseGame();
+  }
+};
+
+game.onShardCollected = () => {
+  const p = game.player;
+  p.xp++;
+  if (sfxReady('shard', 0.04)) sound.shard();
+  if (p.xp >= p.xpNext && game.state === 'playing') levelUp();
+};
+
+game.onDevourerSpawn = (boss) => {
+  const minions = game.pools.enemies.filter((e) => e.type !== 'devourer').length;
+  if (minions >= 5) return;
+  const minion = makeHostile('chaser', boss.x, boss.y, game.wave, game.rng);
+  game.pools.enemies.push(minion);
+  burst(boss.x, boss.y, '#c44dff', 6, 160, 0.35);
+};
+
+game.onDevourerFed = (boss, rock) => {
+  burst(rock.x, rock.y, '#b46bff', 4, 120, 0.3);
+  floater(boss.x, boss.y - boss.r - 14, 'FED +HP', '#d9b3ff', 15);
+};
+
+// --- run control --------------------------------------------------------------
+
+function startRun() {
+  resetEntityIds();
+  game.pools = createPools();
+  game.player = makePlayer();
+  game.combo.reset();
+  game.score = 0;
+  game.kills = 0;
+  game.time = 0;
+  game.shake = 0;
+  game.sfxT = {};
+  // Opening drifters, so the first captures come quickly.
+  for (let i = 0; i < 6; i++) {
+    const pt = edgeSpawnPoint(game.rng, -30);
+    const rock = makeRock(game.rng, clamp(pt.x, 40, WORLD_W - 40), clamp(pt.y, 40, WORLD_H - 40));
+    game.pools.rocks.push(rock);
+  }
+  hud.hideOverlays();
+  sound.unlock();
+  sound.uiStart();
+  startWave(1);
+  game.state = 'playing';
+}
+
+function startWave(n) {
+  game.wave = n;
+  game.spawner = createSpawner(n, game.rng);
+  game.wavePhase = 'active';
+  hud.showBanner(n % 5 === 0 ? `WAVE ${n} — THE DEVOURER` : `WAVE ${n}`, game.time);
+}
+
+function levelUp() {
+  const p = game.player;
+  p.level++;
+  p.xp -= p.xpNext;
+  p.xpNext = 5 + p.level * 4;
+  game.pendingChoices = rollUpgrades(game.rng, p, 3);
+  sound.level();
+  ringFx(p.x, p.y, 'rgba(103, 246, 255, 0.9)', 5, 0.5);
+  if (game.demo) {
+    game.autoPickT = 0.7;
+    game.state = 'upgrade';
+    hud.showUpgrades(game.pendingChoices, p, chooseUpgrade);
+  } else {
+    game.state = 'upgrade';
+    hud.showUpgrades(game.pendingChoices, p, chooseUpgrade);
+  }
+}
+
+function chooseUpgrade(choice) {
+  if (game.state !== 'upgrade' || !game.pendingChoices) return;
+  choice.apply(game.player);
+  floater(game.player.x, game.player.y - 40, choice.name.toUpperCase(), '#67f6ff', 22);
+  game.pendingChoices = null;
+  hud.hideOverlays();
+  game.state = 'playing';
+}
+
+function winGame() {
+  if (game.state !== 'playing') return;
+  game.score += Math.round(game.player.hull) * 10; // hull bonus
+  game.state = 'won';
+  sound.win();
+  burst(game.player.x, game.player.y, '#ffd34d', 46, 420, 0.9);
+  ringFx(game.player.x, game.player.y, 'rgba(255, 210, 120, 0.95)', 6, 0.8);
+  hud.showEnd(true, game);
+}
+
+function loseGame() {
+  if (game.state !== 'playing') return;
+  game.state = 'lost';
+  sound.lose();
+  burst(game.player.x, game.player.y, '#ff8a3c', 40, 380, 0.8);
+  game.shake = 18;
+  hud.showEnd(false, game);
+}
+
+window.addEventListener('keydown', (event) => {
+  if (game.state !== 'upgrade' || !game.pendingChoices) return;
+  const idx = ['Digit1', 'Digit2', 'Digit3'].indexOf(event.code);
+  if (idx >= 0 && game.pendingChoices[idx]) chooseUpgrade(game.pendingChoices[idx]);
+});
+
+// --- demo autopilot -------------------------------------------------------------
+
+function nearestOf(list, x, y, filter) {
+  let best = null;
+  let bestD = Infinity;
+  for (const item of list) {
+    if (filter && !filter(item)) continue;
+    const d = distance(x, y, item.x, item.y);
+    if (d < bestD) {
+      bestD = d;
+      best = item;
+    }
+  }
+  return best ? { item: best, dist: bestD } : null;
+}
+
+function autopilot(dt) {
+  const p = game.player;
+  const intent = { mx: 0, my: 0 };
+  const orbit = orbitingRocks(game).length;
+  // Pick a goal: fill the orbit first, then vacuum shards, then hold center.
+  let goal = null;
+  if (orbit < p.orbitCap) goal = nearestOf(game.pools.rocks, p.x, p.y, (r) => r.mode === 'drift');
+  if (!goal) goal = nearestOf(game.pools.shards, p.x, p.y);
+  let gx = WORLD_W / 2;
+  let gy = WORLD_H / 2;
+  if (goal) {
+    gx = goal.item.x;
+    gy = goal.item.y;
+  }
+  let mx = gx - p.x;
+  let my = gy - p.y;
+  // Flee anything close enough to bite.
+  const threat = nearestOf(game.pools.enemies, p.x, p.y);
+  if (threat && threat.dist < 165) {
+    mx += (p.x - threat.item.x) * 2.4;
+    my += (p.y - threat.item.y) * 2.4;
+  }
+  const len = Math.hypot(mx, my) || 1;
+  intent.mx = clamp(mx / len, -1, 1);
+  intent.my = clamp(my / len, -1, 1);
+  // Aim and fire discipline: lead the target by the rock's flight time.
+  if (threat) {
+    const lead = threat.dist / 980;
+    game.aimX = threat.item.x + threat.item.vx * lead;
+    game.aimY = threat.item.y + threat.item.vy * lead;
+  }
+  game.autoFlingT -= dt;
+  if (orbit >= 2 && threat && threat.dist < 430 && game.autoFlingT <= 0) {
+    flingRock(game, game.aimX, game.aimY);
+    game.autoFlingT = 0.65;
+  }
+  const nearCount = game.pools.enemies.filter((e) => distance(p.x, p.y, e.x, e.y) < 300).length;
+  if (orbit >= 4 && p.novaCd <= 0 && nearCount >= 2) novaBlast(game);
+  return intent;
+}
+
+// --- the step -------------------------------------------------------------------
+
+function handleActions() {
+  for (const action of input.drainActions()) {
+    if (action === 'mute') {
+      sound.unlock();
+      hud.setMuted(sound.toggleMute());
+      continue;
+    }
+    if (game.state === 'title' && action === 'start') {
+      startRun();
+    } else if (game.state === 'playing') {
+      if (action === 'fling' && !game.demo) flingRock(game, game.aimX, game.aimY);
+      else if (action === 'nova' && !game.demo) novaBlast(game);
+      else if (action === 'pause') {
+        game.state = 'paused';
+        hud.showOverlay('pause');
+      }
+    } else if (game.state === 'paused' && action === 'pause') {
+      game.state = 'playing';
+      hud.hideOverlays();
+    } else if ((game.state === 'won' || game.state === 'lost' || game.state === 'paused') && action === 'restart') {
+      startRun();
+    }
+  }
+}
+
+function step(dt) {
+  if (game.frozen) return;
+  handleActions();
+  if (game.state === 'paused' || game.state === 'upgrade') {
+    if (game.state === 'upgrade' && game.demo && game.pendingChoices) {
+      game.autoPickT -= dt;
+      if (game.autoPickT <= 0) chooseUpgrade(game.pendingChoices[0]);
     }
     return;
   }
-
-  if (state.mode === 'paused') {
-    if (input.wasPressed('KeyP') || input.mouse.clicked) state.mode = 'playing';
+  game.time += dt;
+  game.shake = Math.max(0, game.shake - dt * 30);
+  if (game.state === 'title' || game.state === 'won' || game.state === 'lost') {
+    stepEffects(game, dt);
     return;
   }
-
-  if (state.mode === 'won' || state.mode === 'lost') {
-    state.endAt += dt;
-    const restart = input.wasPressed('KeyR') || input.wasPressed('Enter') ||
-      (input.mouse.clicked && state.endAt > 0.4);
-    if (restart || (state.demo && state.endAt > 3)) resetGame();
-    return;
-  }
-
   // playing
-  if (input.wasPressed('KeyP') && !state.demo) {
-    state.mode = 'paused';
-    return;
+  if (!game.demo) {
+    game.aimX = input.mouse.x;
+    game.aimY = input.mouse.y;
   }
-  state.director.update(state, dt);
-  maintainAsteroids(state, dt);
-  const control = state.demo ? autopilotControl() : playerControl();
-  state.aim = control;
-  stepPhysics(state, dt, control);
+  const intent = game.demo ? autopilot(dt) : normalizeMove(input.moveVector());
+  stepPlayer(game, intent, dt);
 
-  if (state.bossDown) {
-    state.mode = 'won';
-    state.endAt = 0;
-    audio.win();
-    spawnExplosion(state, state.star.x, state.star.y, '#ffd166', 50, 320);
-    return;
-  }
-  if (state.starDead) {
-    if (!state.starHidden) {
-      state.starHidden = true;
-      state.deathTimer = 1.3;
-      spawnExplosion(state, state.star.x, state.star.y, '#54f0ff', 46, 320);
+  // Spawn the wave, one hostile at a time.
+  if (game.spawner && game.wavePhase === 'active') {
+    const spawned = game.spawner.next(game, dt);
+    if (spawned) {
+      spawned.bornAt = game.time;
+      game.pools.enemies.push(spawned);
+      if (spawned.type === 'devourer') {
+        sound.bossRoar();
+        game.shake = Math.max(game.shake, 8);
+        hud.showBanner('THE DEVOURER AWAKENS', game.time, 1.8);
+      }
     }
-    state.deathTimer -= dt;
-    if (state.deathTimer <= 0) {
-      state.mode = 'lost';
-      state.endAt = 0;
+  }
+  // Ambient asteroids drift in so there is always something to capture.
+  game.rockSpawnT -= dt;
+  if (game.rockSpawnT <= 0) {
+    game.rockSpawnT = 0.8;
+    if (game.pools.rocks.length < AMBIENT_ROCK_TARGET) {
+      const pt = edgeSpawnPoint(game.rng, 24);
+      const rock = makeRock(game.rng, pt.x, pt.y);
+      const a = angleTo(rock.x, rock.y, WORLD_W / 2 + game.rng.range(-160, 160), WORLD_H / 2 + game.rng.range(-120, 120));
+      const v = game.rng.range(24, 52);
+      rock.vx = Math.cos(a) * v;
+      rock.vy = Math.sin(a) * v;
+      game.pools.rocks.push(rock);
     }
-    return;
   }
-  if (state.levelReady) {
-    state.levelReady = false;
-    enterLevelUp();
+
+  stepRocks(game, dt);
+  stepEnemies(game, dt);
+  stepShards(game, dt);
+  collide(game);
+  stepEffects(game, dt);
+
+  // Wave clear: everything spawned and everything dead.
+  if (game.wavePhase === 'active' && game.spawner && game.spawner.done() && game.pools.enemies.length === 0 && game.state === 'playing') {
+    game.wavePhase = 'clear';
+    game.clearT = 1.7;
+    const bonus = 100 * game.wave;
+    game.score += bonus;
+    floater(WORLD_W / 2, WORLD_H / 2 - 60, `WAVE CLEAR +${bonus}`, '#67f6ff', 30);
+  } else if (game.wavePhase === 'clear') {
+    game.clearT -= dt;
+    if (game.clearT <= 0 && game.state === 'playing') startWave(game.wave + 1);
   }
 }
 
-function render() {
-  ctx.save();
-  if (state.shake > 0.3) {
-    ctx.translate((Math.random() - 0.5) * state.shake, (Math.random() - 0.5) * state.shake);
-  }
-  drawScene(ctx, state);
-  ctx.restore();
-  if (state.mode === 'playing' || state.mode === 'levelup' || state.mode === 'paused') {
-    drawHud(ctx, state);
-    drawWaveBanner(ctx, state);
-  }
-  if (state.mode === 'title') drawTitleScreen(ctx, state);
-  else if (state.mode === 'levelup') drawLevelUpScreen(ctx, state);
-  else if (state.mode === 'paused') drawPausedOverlay(ctx, state);
-  else if (state.mode === 'won') drawEndScreen(ctx, state, true);
-  else if (state.mode === 'lost') drawEndScreen(ctx, state, false);
+function normalizeMove({ mx, my }) {
+  const len = Math.hypot(mx, my);
+  if (len <= 1) return { mx, my };
+  return { mx: mx / len, my: my / len };
 }
 
-let last = performance.now();
-let frames = 0;
-function loop(now) {
-  const dt = Math.min(0.033, (now - last) / 1000 || 0.016);
-  last = now;
-  update(dt);
-  render();
-  input.endFrame();
-  frames += 1;
-  if (frames > 40 && !window.__shotReady) window.__shotReady = true;
-  requestAnimationFrame(loop);
+// --- main loop --------------------------------------------------------------------
+
+let lastStamp = performance.now();
+let accumulator = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - lastStamp) / 1000);
+  lastStamp = now;
+  accumulator += dt;
+  while (accumulator >= STEP) {
+    step(STEP);
+    accumulator -= STEP;
+  }
+  renderer.draw(game);
+  hud.update(game);
 }
-requestAnimationFrame(loop);
+
+// --- screenshot scenes ------------------------------------------------------------
+// Frozen, hand-posed moments of real gameplay, rendered by this same code.
+// The driver loads ?shot=<name>, waits for the scene to settle, and captures.
+
+function poseOrbit(count) {
+  const p = game.player;
+  for (let i = 0; i < count; i++) {
+    const rock = makeRock(game.rng, 0, 0);
+    rock.mode = 'orbit';
+    rock.orbitRadius = 56 + (i % 3) * 17;
+    rock.orbitAngle = (i / count) * TAU + 0.55;
+    rock.orbitTime = 3 - i * 0.35;
+    rock.x = p.x + Math.cos(rock.orbitAngle) * rock.orbitRadius;
+    rock.y = p.y + Math.sin(rock.orbitAngle) * rock.orbitRadius;
+    game.pools.rocks.push(rock);
+  }
+}
+
+function poseFlungRock(x, y, targetX, targetY) {
+  const rock = makeRock(game.rng, x, y);
+  rock.mode = 'flung';
+  const a = angleTo(x, y, targetX, targetY);
+  rock.vx = Math.cos(a) * 980;
+  rock.vy = Math.sin(a) * 980;
+  for (let i = 12; i >= 1; i--) {
+    rock.trail.push({ x: x - Math.cos(a) * i * 13, y: y - Math.sin(a) * i * 13 });
+  }
+  game.pools.rocks.push(rock);
+  return rock;
+}
+
+function setupShotPlay() {
+  startRun();
+  hud.hideBanner();
+  const p = game.player;
+  game.wave = 3;
+  game.spawner = createSpawner(3, game.rng);
+  game.spawner.remaining = 0;
+  p.x = 430;
+  p.y = 400;
+  p.hull = 76;
+  p.xp = 5;
+  game.score = 1450;
+  poseOrbit(5);
+  game.pools.enemies.push(makeHostile('chaser', 770, 250, 3, game.rng));
+  game.pools.enemies.push(makeHostile('chaser', 848, 448, 3, game.rng));
+  game.pools.enemies.push(makeHostile('splitter', 688, 545, 3, game.rng));
+  game.pools.enemies.push(makeHostile('dart', 612, 172, 3, game.rng));
+  game.pools.enemies.push(makeHostile('dart', 908, 302, 3, game.rng));
+  for (const [sx, sy] of [[560, 300], [598, 472], [516, 182], [982, 424], [736, 372]]) {
+    game.pools.shards.push(makeShard(sx, sy, game.rng));
+  }
+  poseFlungRock(588, 332, 770, 250);
+  burst(770, 250, '#ff4d6d', 7, 230, 0.6);
+  game.combo.beginNova(0.02);
+  game.combo.registerKill(0.06);
+  game.combo.registerKill(0.1);
+  game.aimX = 770;
+  game.aimY = 250;
+  game.frozen = true;
+}
+
+function setupShotBoss() {
+  startRun();
+  hud.hideBanner();
+  const p = game.player;
+  game.wave = 5;
+  game.spawner = createSpawner(5, game.rng);
+  game.spawner.remaining = 0;
+  p.x = 395;
+  p.y = 385;
+  p.hull = 64;
+  p.xp = 3;
+  game.score = 3900;
+  poseOrbit(4);
+  const boss = makeHostile('devourer', 868, 318, 5, game.rng);
+  boss.hp = 33;
+  game.pools.enemies.push(boss);
+  game.pools.enemies.push(makeHostile('chaser', 692, 168, 5, game.rng));
+  game.pools.enemies.push(makeHostile('dart', 978, 472, 5, game.rng));
+  poseFlungRock(520, 360, 868, 318);
+  burst(868, 318, '#c44dff', 9, 260, 0.6);
+  game.aimX = 868;
+  game.aimY = 318;
+  game.frozen = true;
+}
+
+function setupShotOver() {
+  startRun();
+  hud.hideBanner();
+  game.score = 12850;
+  game.kills = 132;
+  game.wave = 10;
+  game.time = 402.5;
+  game.state = 'won';
+  burst(game.player.x, game.player.y, '#ffd34d', 30, 380, 0.9);
+  ringFx(game.player.x, game.player.y, 'rgba(255, 210, 120, 0.95)', 6, 0.8);
+  hud.showEnd(true, game);
+  game.frozen = true;
+}
+
+// --- boot ---------------------------------------------------------------------------
+
+if (shotMode === 'play') setupShotPlay();
+else if (shotMode === 'boss') setupShotBoss();
+else if (shotMode === 'over') setupShotOver();
+else if (demoMode) startRun();
+else hud.showOverlay('title');
+
+// A small handle for automated play-tests: read state, start a run, wound the
+// star. It changes nothing for a human player.
+window.__starforge = { game, startRun, version: 'starforge-v2' };
+
+requestAnimationFrame(frame);
