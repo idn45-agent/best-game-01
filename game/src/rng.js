@@ -1,47 +1,44 @@
-// rng.js — one seeded random stream for the whole game.
-// Every random choice in STARFORGE flows through here, so a run is fully
-// reproducible from its seed (?seed=N in the URL, or a shot's fixed seed).
-// The generator is mulberry32: tiny, fast, and good enough for arcade work.
+// rng.js — Seeded random numbers (mulberry32) for STARFORGE.
+//
+// Every random draw in the game goes through one of these helpers so a
+// screenshot scene (?shot=…&seed=N) renders deterministically: same seed,
+// same asteroids, same enemies, same draft.
 
-let state = 1;
-
-// initRng(seed) — (re)seed the stream. Seed 0 is remapped because a zero
-// state would stick mulberry32 at a degenerate point.
-export function initRng(seed) {
-  state = (seed >>> 0) || 0x9e3779b9;
+export function makeRng(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-// rnd() — the next float in [0, 1).
-export function rnd() {
-  state = (state + 0x6d2b79f5) | 0;
-  let t = Math.imul(state ^ (state >>> 15), 1 | state);
-  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+// Integer in [min, max] inclusive.
+export function randInt(rng, min, max) {
+  return min + Math.floor(rng() * (max - min + 1));
 }
 
-// rr(a, b) — float in [a, b). ri(a, b) — integer in [a, b], inclusive.
-export function rr(a, b) {
-  return a + rnd() * (b - a);
+// Float in [min, max).
+export function randRange(rng, min, max) {
+  return min + rng() * (max - min);
 }
 
-export function ri(a, b) {
-  return Math.floor(rr(a, b + 1));
+// Pick one element of an array.
+export function randPick(rng, arr) {
+  return arr[Math.floor(rng() * arr.length)];
 }
 
-// pick(arr) — one element at random. chance(p) — true with probability p.
-export function pick(arr) {
-  return arr[Math.floor(rnd() * arr.length)];
+// Fisher–Yates shuffle, in place, using the seeded rng.
+export function shuffle(rng, arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
-export function chance(p) {
-  return rnd() < p;
-}
-
-// angle() — a random direction in radians. jitter(v, amt) — v ± amt.
-export function angle() {
-  return rnd() * Math.PI * 2;
-}
-
-export function jitter(v, amt) {
-  return v + rr(-amt, amt);
+// A random angle in radians.
+export function randAngle(rng) {
+  return rng() * Math.PI * 2;
 }

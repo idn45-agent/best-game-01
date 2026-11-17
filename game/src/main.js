@@ -1,509 +1,508 @@
-// main.js — STARFORGE's conductor: owns the run state G, the mode machine
-// (title → playing ⇄ levelup → won/lost, plus the demo attract mode), the
-// frame loop, and the deterministic ?shot= staging used for screenshots.
-// The simulation lives in physics.js, the pictures in render.js and hud.js;
-// this file only decides what happens next.
+// main.js — STARFORGE: state, game loop and mode machine.
 //
-// URL hooks: ?seed=N fixes the random stream, ?demo=1 starts the autopilot
-// attract mode, ?shot=title|play|boss|win|lose stages one frozen scene and
-// raises window.__shotReady when it is safe to capture.
+// Modes: title → playing → draft (level-up) / paused → gameover | victory.
+// A run is ten waves; wave 10 is the Devourer, and killing it ignites the
+// star (victory). The loop runs at a clamped delta so a slow frame cannot
+// tunnel a bullet through the ship.
+//
+// Deterministic screenshots: ?shot=title|play|boss|victory&seed=N builds a
+// fixed scene with a seeded RNG, advances it a fixed number of ticks with a
+// scripted autopilot, freezes, and sets window.__shotReady.
 
-import { initRng, rnd, ri } from './rng.js';
-import { initInput, keys, mouse, pressed, endFrame, moveVector } from './input.js';
-import { initAudio, resumeAudio, toggleMute, sfx } from './audio.js';
-import { initWorld, updateFx, WORLD_W, WORLD_H } from './world.js';
-import { makePlayer, makeRock, makeEnemy, spawnRockAtEdge } from './entities.js';
+import { makeRng, randRange } from './rng.js';
+import { SoundEngine } from './audio.js';
+import { Input } from './input.js';
+import { updateParticles } from './particles.js';
 import {
-  updatePlayer, updateRocks, updateOrbit, updateShots, updateEnemies,
-  updateBolts, updateShards, resolveCollisions, flingRock, fireNova, banner,
-} from './physics.js';
-import { createCombo, updateCombo } from './combo.js';
-import { defaultMods, xpForLevel, rollChoices, applyUpgrade } from './upgrades.js';
-import { startWave, updateWaves } from './waves.js';
-import { drawGame } from './render.js';
-import { drawHud, drawTitle, drawLevelUp, drawEndScreen, cardRects } from './hud.js';
+  computeStats, rollDraft, applyUpgradeChoice,
+  dominantBuild, activeSynergies,
+} from './upgrades.js';
+import { updateEnemies, spawnEnemy } from './enemies.js';
+import { updateBoss } from './boss.js';
+import { startWave, updateWaves, spawnAsteroid } from './waves.js';
+import { createPlayer, updatePlayer, saveBest, loadBest, detonateNova } from './player.js';
+import { render } from './render.js';
 
-const params = new URLSearchParams(location.search);
-const seedParam = Number.parseInt(params.get('seed') || '', 10);
-const hasSeed = Number.isFinite(seedParam);
-const demoParam = params.get('demo') === '1';
-const shotName = params.get('shot');
+const W = 1280;
+const H = 720;
 
-const canvas = document.getElementById('game');
-const g = canvas.getContext('2d');
-
-// toWorld(clientX, clientY) — page pixels to arena pixels; the canvas is
-// CSS-scaled as one block, so a single ratio per axis is exact.
-function toWorld(clientX, clientY) {
-  const r = canvas.getBoundingClientRect();
-  return {
-    x: (clientX - r.left) * (WORLD_W / r.width),
-    y: (clientY - r.top) * (WORLD_H / r.height),
-  };
-}
-
-// freshRun(seed) — a complete new run state. Everything the other modules
-// read hangs off this object; nothing about a run lives anywhere else.
-function freshRun(seed) {
-  initRng(seed);
-  return {
-    mode: 'playing',
+export function createState(canvas) {
+  const rng = makeRng((Math.random() * 0xffffffff) >>> 0);
+  const state = {
+    canvas,
+    ctx: canvas.getContext('2d'),
+    rng,
+    input: new Input(canvas),
+    audio: new SoundEngine(),
+    mode: 'title',
+    frozen: false,
     time: 0,
-    runTime: 0,
-    score: 0,
-    kills: 0,
+    elapsed: 0,
     wave: 0,
-    level: 1,
-    xp: 0,
-    xpNext: xpForLevel(1),
-    player: makePlayer(),
-    mods: defaultMods(),
-    taken: {},
-    synergyCannonPierce: false,
-    rocks: [],
-    orbit: [],
-    shots: [],
+    waveTotal: 0,
+    waveKills: 0,
+    score: 0,
+    best: loadBest(),
+    kills: 0,
+    chain: 0,
+    chainTimer: 0,
+    chainBest: 0,
+    player: createPlayer(),
     enemies: [],
-    bolts: [],
-    shards: [],
-    combo: createCombo(),
-    stats: { captures: 0, flings: 0, novas: 0, maxChain: 0, leechCount: 0 },
+    shots: [],
+    enemyBullets: [],
+    gems: [],
+    asteroids: [],
+    burnZones: [],
+    particles: [],
+    shockwaves: [],
+    floaters: [],
+    upgradesTaken: {},
+    paths: { nova: 0, pierce: 0, forge: 0 },
+    draftChoices: [],
+    draftRects: [],
+    draftHover: -1,
+    pendingLevels: 0,
+    boss: null,
+    bossSpawned: false,
+    spawnQueue: [],
+    spawnTimer: 0,
+    intermission: 0,
+    asteroidTimer: 0,
     banner: null,
-    choices: [],
-    waveState: null,
-    aimX: WORLD_W / 2,
-    aimY: 140,
     shake: 0,
-    flashT: 0,
-    rockT: 0,
-    pendingLevel: false,
-    pendingWin: false,
-    pendingLose: false,
-    endT: 0,
-    endWon: false,
-    levelT: 0,
-    paused: false,
-    demo: false,
-    seed,
+    stars: [],
+    nebulas: [],
+    stats: null,
+    build: { key: 'mixed', title: 'UNFORGED', counts: {} },
+    synergies: [],
+    runStats: { shotsFired: 0, novas: 0 },
   };
+  // Starfield and nebulae: fixed for the run, twinkle by time.
+  for (let i = 0; i < 170; i++) {
+    state.stars.push({
+      x: randRange(rng, 0, W),
+      y: randRange(rng, 0, H),
+      r: randRange(rng, 1, 2.4),
+      tw: randRange(rng, 0.6, 2.4),
+      ph: randRange(rng, 0, Math.PI * 2),
+      color: rng() < 0.8 ? '#cfe0ff' : '#ffe9b0',
+    });
+  }
+  const nebColors = ['#2a1a5e', '#123a5e', '#4a1a3a', '#1a4a3a'];
+  for (let i = 0; i < 5; i++) {
+    state.nebulas.push({
+      x: randRange(rng, 0, W),
+      y: randRange(rng, 0, H),
+      r: randRange(rng, 180, 320),
+      color: nebColors[i % nebColors.length],
+    });
+  }
+  state.stats = computeStats(state);
+  refreshBuild(state);
+  return state;
 }
 
-let G = null;
-let runCount = 0;
-let titleIdle = 0;
-
-// runSeed() — the seed for the next run: the URL's when given (so links
-// and screenshots reproduce), otherwise a fresh one from the clock.
-function runSeed() {
-  runCount += 1;
-  return hasSeed ? seedParam + runCount * 7919 : (Date.now() % 90000) + 10000;
+export function refreshBuild(state) {
+  state.build = dominantBuild(state);
+  state.synergies = activeSynergies(state);
 }
 
-// toTitle() — park on the title screen with an empty, quiet arena.
-function toTitle() {
-  G = freshRun(hasSeed ? seedParam : 4242);
-  G.mode = 'title';
-  G.player.dead = true; // the emblem replaces the ship on the title
-  titleIdle = 0;
+export function resetRun(state) {
+  state.player = createPlayer();
+  state.enemies = [];
+  state.shots = [];
+  state.enemyBullets = [];
+  state.gems = [];
+  state.asteroids = [];
+  state.burnZones = [];
+  state.particles = [];
+  state.shockwaves = [];
+  state.floaters = [];
+  state.upgradesTaken = {};
+  state.paths = { nova: 0, pierce: 0, forge: 0 };
+  state.draftChoices = [];
+  state.pendingLevels = 0;
+  state.boss = null;
+  state.bossSpawned = false;
+  state.spawnQueue = [];
+  state.intermission = 0;
+  state.asteroidTimer = 0;
+  state.score = 0;
+  state.kills = 0;
+  state.chain = 0;
+  state.chainTimer = 0;
+  state.chainBest = 0;
+  state.elapsed = 0;
+  state.wave = 0;
+  state.banner = null;
+  state.shake = 0;
+  state.runStats = { shotsFired: 0, novas: 0 };
+  state.stats = computeStats(state);
+  refreshBuild(state);
+  // Opening fuel: four asteroids already drifting toward the well, so the
+  // first rocks are captured within a second or two — the forge is never
+  // left with no shield and no ammo at the start of a run.
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + 0.5;
+    state.asteroids.push({
+      x: 640 + Math.cos(a) * 180,
+      y: 360 + Math.sin(a) * 180,
+      vx: -Math.cos(a) * 55,
+      vy: -Math.sin(a) * 55,
+      radius: 9,
+      angle: a,
+      spin: 0.6,
+      captured: false,
+      life: 30,
+    });
+  }
+  for (let i = 0; i < 2; i++) spawnAsteroid(state);
 }
 
-// startRun(demo) — a real run: wave 1, a starter scatter of rocks, and
-// (for humans) the audio context unlocked by the gesture that got us here.
-function startRun(demo) {
-  G = freshRun(runSeed());
-  G.demo = demo;
-  for (let i = 0; i < 6; i++) {
-    const rock = makeRock(140 + rnd() * (WORLD_W - 280), 120 + rnd() * (WORLD_H - 240));
-    G.rocks.push(rock);
-  }
-  startWave(G, 1);
-  if (!demo) {
-    initAudio();
-    resumeAudio();
+export function startRun(state) {
+  resetRun(state);
+  state.mode = 'playing';
+  startWave(state, 1);
+}
+
+function chooseDraftCard(state, index) {
+  const card = state.draftChoices[index];
+  if (!card) return;
+  applyUpgradeChoice(state, card);
+  refreshBuild(state);
+  state.audio.pickup();
+  if (state.pendingLevels > 0) {
+    state.pendingLevels--;
+    state.draftChoices = rollDraft(state);
+  } else {
+    state.mode = 'playing';
   }
 }
 
-// autopilot(G) — the demo pilot, and the play-test driver: it plays the
-// real game through the same control shape a human produces. It feeds the
-// orbit first, then holds a strafing distance, leads its throws, and novas
-// into crowds. Returns { move, aimX, aimY, fling, nova }.
-function autopilot(G) {
-  const p = G.player;
-  const ctrl = { move: { x: 0, y: 0 }, aimX: p.x + 100, aimY: p.y, fling: false, nova: false };
-  let nearestRock = null;
-  let rockD = Infinity;
-  for (const r of G.rocks) {
-    const d = Math.hypot(r.x - p.x, r.y - p.y);
-    if (d < rockD) { rockD = d; nearestRock = r; }
+function handleInput(state) {
+  const input = state.input;
+  if (input.anyGesture) {
+    state.audio.ensure();
+    input.anyGesture = false;
   }
-  let nearestFoe = null;
-  let foeD = Infinity;
-  let crowd = 0;
-  for (const e of G.enemies) {
-    const d = Math.hypot(e.x - p.x, e.y - p.y);
-    if (d < foeD) { foeD = d; nearestFoe = e; }
-    if (d < 250) crowd += 1;
+  if (input.wasPressed('m')) {
+    const muted = state.audio.toggleMute();
+    state.banner = { text: muted ? 'SOUND OFF' : 'SOUND ON', sub: '', t: 0.9 };
   }
-  if (G.orbit.length < 3 && nearestRock) {
-    // Feed the orbit: park just off the rock and let the well reel it in.
-    const want = 92;
-    const dx = nearestRock.x - p.x;
-    const dy = nearestRock.y - p.y;
-    const d = Math.hypot(dx, dy) || 1;
-    ctrl.move.x = (dx / d) * (d > want ? 1 : -0.4);
-    ctrl.move.y = (dy / d) * (d > want ? 1 : -0.4);
-  } else if (nearestFoe) {
-    // Strafe the nearest hunter at range, circling slowly.
-    const dx = p.x - nearestFoe.x;
-    const dy = p.y - nearestFoe.y;
-    const d = Math.hypot(dx, dy) || 1;
-    const radial = foeD < 240 ? 1 : foeD > 380 ? -1 : 0;
-    const side = Math.sin(G.time * 0.7) > 0 ? 1 : -1;
-    ctrl.move.x = (dx / d) * radial + (-dy / d) * 0.7 * side;
-    ctrl.move.y = (dy / d) * radial + (dx / d) * 0.7 * side;
-    const len = Math.hypot(ctrl.move.x, ctrl.move.y) || 1;
-    ctrl.move.x /= len;
-    ctrl.move.y /= len;
-  }
-  // Dodge the nearest inbound bolt with a perpendicular step.
-  for (const b of G.bolts) {
-    const d = Math.hypot(b.x - p.x, b.y - p.y);
-    if (d < 130) {
-      const bl = Math.hypot(b.vx, b.vy) || 1;
-      ctrl.move.x += (-b.vy / bl) * 0.9;
-      ctrl.move.y += (b.vx / bl) * 0.9;
+
+  if (state.mode === 'title') {
+    if (input.mouseClicked || input.wasPressed('enter') || input.wasPressed(' ')) {
+      startRun(state);
     }
+    return;
   }
-  if (nearestFoe) {
-    const lead = foeD / 920;
-    ctrl.aimX = nearestFoe.x + nearestFoe.vx * lead;
-    ctrl.aimY = nearestFoe.y + nearestFoe.vy * lead;
-    if (G.orbit.length > 0 && foeD < 560 && p.flingCd <= 0) ctrl.fling = true;
-    if (p.novaCharge >= 1 && G.orbit.length >= 3 && (crowd >= 3 || (nearestFoe.kind === 'boss' && foeD < 280))) {
-      ctrl.nova = true;
+  if (state.mode === 'playing') {
+    if (input.wasPressed('p') || input.wasPressed('escape')) {
+      state.mode = 'paused';
+    } else if (input.wasPressed('r')) {
+      startRun(state);
     }
+    return;
   }
-  return ctrl;
-}
-
-// humanControl() — this frame's control from keyboard and mouse.
-function humanControl() {
-  return {
-    move: moveVector(),
-    aimX: mouse.x,
-    aimY: mouse.y,
-    fling: mouse.down || keys.Space === true,
-    nova: pressed('KeyE') || pressed('ShiftLeft') || pressed('ShiftRight'),
-  };
-}
-
-// updatePlaying(G, dt, ctrl) — one simulation step of a live run, shared
-// by human play, the demo, and screenshot staging.
-function updatePlaying(G, dt, ctrl) {
-  const p = G.player;
-  G.time += dt;
-  G.runTime += dt;
-  if (G.banner) {
-    G.banner.t += dt;
-    if (G.banner.t >= G.banner.life) G.banner = null;
-  }
-  p.face = Math.atan2(ctrl.aimY - p.y, ctrl.aimX - p.x);
-  G.aimX = ctrl.aimX;
-  G.aimY = ctrl.aimY;
-  updatePlayer(G, dt, ctrl.move);
-  if (ctrl.fling) flingRock(G, ctrl.aimX, ctrl.aimY);
-  if (ctrl.nova) fireNova(G);
-  updateRocks(G, dt);
-  updateOrbit(G, dt);
-  updateShots(G, dt);
-  updateEnemies(G, dt);
-  updateBolts(G, dt);
-  updateShards(G, dt);
-  resolveCollisions(G);
-  updateCombo(G, dt);
-  updateWaves(G, dt);
-  updateFx(dt);
-  // Keep the asteroid supply flowing: orbit ammo has to come from somewhere.
-  G.rockT -= dt;
-  if (G.rocks.length + G.orbit.length < 9 && G.rockT <= 0) {
-    G.rocks.push(spawnRockAtEdge(p));
-    G.rockT = 1.1;
-  }
-  G.shake = Math.max(0, G.shake - dt * 34);
-  if (G.flashT > 0) G.flashT -= dt;
-  if (G.pendingWin || G.pendingLose) {
-    G.endWon = G.pendingWin;
-    G.pendingWin = false;
-    G.pendingLose = false;
-    G.endT = 1.1;
-    G.mode = 'ending';
-    if (G.endWon) p.invulnT = 999;
-  } else if (G.pendingLevel && !p.dead) {
-    G.pendingLevel = false;
-    G.choices = rollChoices(G);
-    G.levelT = 0;
-    G.mode = 'levelup';
-    sfx('levelup');
-  }
-}
-
-// anyUserInput() — has the human touched anything this frame? The demo
-// yields the moment they do.
-function anyUserInput() {
-  if (mouse.clicked) return true;
-  const codes = [
-    'Enter', 'Space', 'KeyW', 'KeyA', 'KeyS', 'KeyD',
-    'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyE', 'KeyR',
-  ];
-  return codes.some((c) => pressed(c));
-}
-
-// step(dt) — advance the mode machine one frame.
-function step(dt) {
-  if (pressed('KeyM')) toggleMute();
-  switch (G.mode) {
-    case 'title': {
-      G.time += dt;
-      titleIdle += dt;
-      if (pressed('Enter') || mouse.clicked) startRun(false);
-      else if (titleIdle > 12 && !shotName) startRun(true);
-      break;
+  if (state.mode === 'paused') {
+    if (input.wasPressed('p') || input.wasPressed('escape')) {
+      state.mode = 'playing';
+    } else if (input.wasPressed('r')) {
+      startRun(state);
     }
-    case 'playing': {
-      if (G.demo) {
-        if (anyUserInput()) {
-          toTitle();
+    return;
+  }
+  if (state.mode === 'draft') {
+    if (input.wasPressed('1')) chooseDraftCard(state, 0);
+    else if (input.wasPressed('2')) chooseDraftCard(state, 1);
+    else if (input.wasPressed('3')) chooseDraftCard(state, 2);
+    else if (input.mouseClicked) {
+      for (let i = 0; i < state.draftRects.length; i++) {
+        const r = state.draftRects[i];
+        if (input.mouseX >= r.x && input.mouseX <= r.x + r.w &&
+            input.mouseY >= r.y && input.mouseY <= r.y + r.h) {
+          chooseDraftCard(state, i);
           break;
         }
-        updatePlaying(G, dt, autopilot(G));
-      } else {
-        if (pressed('KeyP')) G.paused = !G.paused;
-        if (!G.paused) updatePlaying(G, dt, humanControl());
       }
-      break;
     }
-    case 'levelup': {
-      G.time += dt;
-      G.levelT += dt;
-      updateFx(dt);
-      let pickIdx = -1;
-      if (pressed('Digit1')) pickIdx = 0;
-      if (pressed('Digit2')) pickIdx = 1;
-      if (pressed('Digit3')) pickIdx = 2;
-      if (mouse.clicked) {
-        const rects = cardRects();
-        for (let i = 0; i < rects.length; i++) {
-          const r = rects[i];
-          if (mouse.x >= r.x && mouse.x <= r.x + r.w && mouse.y >= r.y && mouse.y <= r.y + r.h) {
-            pickIdx = i;
-          }
-        }
+    // Hover highlight for the card under the mouse.
+    state.draftHover = -1;
+    for (let i = 0; i < state.draftRects.length; i++) {
+      const r = state.draftRects[i];
+      if (input.mouseX >= r.x && input.mouseX <= r.x + r.w &&
+          input.mouseY >= r.y && input.mouseY <= r.y + r.h) {
+        state.draftHover = i;
+        break;
       }
-      if (G.demo && G.levelT > 0.9) pickIdx = ri(0, G.choices.length - 1);
-      if (pickIdx >= 0 && G.choices[pickIdx]) {
-        applyUpgrade(G, G.choices[pickIdx]);
-        sfx('ui');
-        if (G.pendingLevel) {
-          G.pendingLevel = false;
-          G.choices = rollChoices(G);
-          G.levelT = 0;
-        } else {
-          G.mode = 'playing';
-        }
-      }
-      break;
     }
-    case 'ending': {
-      G.time += dt;
-      G.endT -= dt;
-      updateFx(dt);
-      updateShots(G, dt);
-      updateBolts(G, dt);
-      if (G.endT <= 0) G.mode = G.endWon ? 'won' : 'lost';
-      break;
+    return;
+  }
+  if (state.mode === 'gameover' || state.mode === 'victory') {
+    if (input.wasPressed('r') || input.wasPressed('enter') || input.mouseClicked) {
+      startRun(state);
     }
-    case 'won':
-    case 'lost': {
-      G.time += dt;
-      updateFx(dt);
-      if (G.demo) {
-        G.endT += dt;
-        if (G.endT > 4.5) startRun(true);
-      } else if (pressed('KeyR') || pressed('Enter')) {
-        startRun(false);
-      }
-      break;
-    }
-    default:
-      break;
   }
 }
 
-// render() — arena first (screen-shaken by impacts), screens over it.
-function render() {
-  g.save();
-  if (G.shake > 0.2) {
-    g.translate((Math.random() - 0.5) * G.shake, (Math.random() - 0.5) * G.shake);
+function updateAmbient(state, dt) {
+  // Title backdrop: asteroids drift through the well's view.
+  for (let i = state.asteroids.length - 1; i >= 0; i--) {
+    const a = state.asteroids[i];
+    a.x += a.vx * dt;
+    a.y += a.vy * dt;
+    a.angle += a.spin * dt;
+    if (Math.abs(a.x) > 1400 || Math.abs(a.y) > 840) state.asteroids.splice(i, 1);
   }
-  drawGame(g, G);
-  g.restore();
-  if (G.mode === 'title') drawTitle(g, G);
-  else if (G.mode === 'playing' || G.mode === 'ending') drawHud(g, G);
-  else if (G.mode === 'levelup') {
-    drawHud(g, G);
-    drawLevelUp(g, G);
-  } else if (G.mode === 'won') drawEndScreen(g, G, true);
-  else if (G.mode === 'lost') drawEndScreen(g, G, false);
-  if (G.paused && G.mode === 'playing') {
-    g.fillStyle = 'rgba(3,6,16,0.55)';
-    g.fillRect(0, 0, WORLD_W, WORLD_H);
-    g.font = "800 42px 'Segoe UI', system-ui, sans-serif";
-    g.textAlign = 'center';
-    g.fillStyle = '#eafcff';
-    g.fillText('PAUSED', WORLD_W / 2, WORLD_H / 2);
-    g.font = "600 16px 'Segoe UI', system-ui, sans-serif";
-    g.fillStyle = 'rgba(190,220,245,0.8)';
-    g.fillText('P — resume', WORLD_W / 2, WORLD_H / 2 + 32);
-  }
-  if (G.demo && (G.mode === 'playing' || G.mode === 'levelup')) {
-    g.font = "700 13px 'Segoe UI', system-ui, sans-serif";
-    g.textAlign = 'center';
-    g.fillStyle = 'rgba(190,220,245,0.65)';
-    g.fillText('DEMO — press any key to play', WORLD_W / 2, WORLD_H - 12);
+  state.asteroidTimer -= dt;
+  if (state.asteroidTimer <= 0) {
+    state.asteroidTimer = 1.4;
+    spawnAsteroid(state);
   }
 }
 
-// stageShot(name) — build one frozen, deterministic scene for a screenshot.
-// Gameplay scenes are assembled from the real factories, settled with real
-// simulation steps, then pinned (hull, chain, boss HP) so the capture is
-// composed rather than lucky. Ends by freezing the state and raising
-// window.__shotReady for the capture harness.
-function stageShot(name) {
-  const still = { move: { x: 0, y: 0 }, aimX: 800, aimY: 215, fling: false, nova: false };
-  if (name === 'title') {
-    toTitle();
-    for (let i = 0; i < 100; i++) step(1 / 60);
-    G.time = 2.0; // pin the clock so the PRESS ENTER blink is mid-visible
-  } else if (name === 'play' || name === 'boss') {
-    startRun(false);
-    const bossScene = name === 'boss';
-    startWave(G, bossScene ? 10 : 3);
-    G.waveState.queue.length = 0;
-    G.banner = null;
-    const p = G.player;
-    p.x = bossScene ? 420 : 470;
-    p.y = bossScene ? 445 : 400;
-    p.invulnT = 30;
-    G.rocks = [makeRock(240, 180), makeRock(1085, 615)];
-    const orbitN = bossScene ? 4 : 5;
-    for (let i = 0; i < orbitN; i++) {
-      const rock = makeRock(0, 0);
-      G.orbit.push({
-        ang: (i / orbitN) * Math.PI * 2 + 0.5,
-        dist: 50 + (i % 3) * 15,
-        r: rock.r, shade: rock.shade, t: 3 + i, x: 0, y: 0,
+function update(state, dt) {
+  state.time += dt;
+  if (state.banner && state.banner.t > 0) state.banner.t -= dt;
+  if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 26);
+
+  if (state.mode === 'title') {
+    updateAmbient(state, dt);
+    updateParticles(state, dt);
+    return;
+  }
+  if (state.mode === 'paused' || state.mode === 'draft') {
+    updateParticles(state, dt);
+    return;
+  }
+  if (state.mode === 'gameover' || state.mode === 'victory') {
+    updateParticles(state, dt);
+    updateAmbient(state, dt);
+    return;
+  }
+  if (state.mode !== 'playing') return;
+
+  state.elapsed += dt;
+  updatePlayer(state, dt);
+  if (state.mode !== 'playing') return; // player died mid-update
+  updateEnemies(state, dt);
+  updateBoss(state, dt);
+  updateWaves(state, dt);
+  updateParticles(state, dt);
+
+  // Victory: the boss is gone and the run reached wave 10.
+  if (state.bossSpawned && !state.boss && state.mode === 'playing') {
+    state.mode = 'victory';
+    state.banner = null;
+    saveBest(state);
+  }
+}
+
+function frame(state, dt) {
+  handleInput(state);
+  update(state, dt);
+  render(state);
+  state.input.endFrame();
+}
+
+// --- Deterministic screenshot scenes -------------------------------------
+//
+// ?shot=title|play|boss|victory&seed=N — build a fixed scene, advance it a
+// fixed number of ticks with a scripted autopilot, freeze, and signal
+// readiness. The render is the game's own code, no edits, no composites.
+
+function autopilotTick(state, tick, target) {
+  const input = state.input;
+  const p = state.player;
+  input.keys.clear();
+  // Low on rocks? Chase the nearest asteroid first — the forge needs fuel.
+  // Otherwise wander between two patrol points so the scene has motion.
+  let tx = tick % 360 < 180 ? 480 : 800;
+  let ty = tick % 360 < 180 ? 300 : 430;
+  if (p.rocks.length < 2 && state.asteroids.length > 0) {
+    let best = null;
+    let bestD = 1e9;
+    for (const a of state.asteroids) {
+      const d = Math.hypot(a.x - p.x, a.y - p.y);
+      if (d < bestD) { bestD = d; best = a; }
+    }
+    if (best) { tx = best.x; ty = best.y; }
+  }
+  if (p.x < tx - 20) input.keys.add('d');
+  if (p.x > tx + 20) input.keys.add('a');
+  if (p.y < ty - 20) input.keys.add('s');
+  if (p.y > ty + 20) input.keys.add('w');
+  // Aim at the nearest threat and throw when loaded.
+  let aim = target;
+  if (!aim) {
+    let bestD = 1e9;
+    for (const e of state.enemies) {
+      const d = Math.hypot(e.x - p.x, e.y - p.y);
+      if (d < bestD) { bestD = d; aim = e; }
+    }
+    if (state.boss) aim = state.boss;
+  }
+  if (aim) {
+    input.mouseX = aim.x;
+    input.mouseY = aim.y;
+  }
+  input.mouseDown = p.throwCd <= 0 && p.rocks.length > 0;
+  if (tick === 150 && p.novaCd <= 0 && p.rocks.length >= 3) {
+    input.pressed.add('e');
+  }
+}
+
+function buildShotScene(state, scene, seed) {
+  state.rng = makeRng(seed);
+  if (scene === 'title') {
+    state.mode = 'title';
+    for (let i = 0; i < 4; i++) {
+      state.player.rocks.push({
+        angle: (i / 4) * Math.PI * 2,
+        dist: 54 + i * 9,
+        size: 9,
       });
     }
-    if (bossScene) {
-      const boss = G.enemies.find((e) => e.kind === 'boss');
-      boss.x = 865;
-      boss.y = 295;
-      boss.hp = Math.round(boss.hpMax * 0.62);
-      G.enemies.push(...stageFoes([['chaser', 1015, 520], ['dart', 705, 150]]));
-      still.aimX = 865;
-      still.aimY = 295;
-      G.score = 38900;
-      G.level = 7;
-    } else {
-      G.enemies.push(
-        ...stageFoes([
-          ['splitter', 800, 215], ['chaser', 905, 330],
-          ['dart', 990, 480], ['chaser', 1052, 208],
-        ]),
-      );
-      G.score = 12480;
-      G.level = 4;
+    for (let i = 0; i < 6; i++) spawnAsteroid(state);
+    for (let i = 0; i < 90; i++) frame(state, 1 / 60);
+  } else if (scene === 'play') {
+    startRun(state);
+    // Jump to wave 3 with a head start: a few upgrades, a live chain.
+    startWave(state, 3);
+    applyUpgradeChoice(state, { id: 'nova-chain', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'ember-trail', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'deadeye', path: 'pierce' });
+    refreshBuild(state);
+    state.score = 2450;
+    state.kills = 41;
+    state.chain = 6;
+    state.chainTimer = state.stats.chainWindow;
+    state.player.level = 4;
+    state.player.xp = 5;
+    for (let i = 0; i < 300; i++) {
+      autopilotTick(state, i);
+      frame(state, 1 / 60);
+      if (state.mode === 'draft') {
+        // The autopilot levelled up: take the first card and keep playing.
+        chooseDraftCard(state, 0);
+      }
+      if (state.mode !== 'playing') break;
     }
-    G.xpNext = xpForLevel(G.level);
-    G.xp = Math.floor(G.xpNext * 0.45);
-    for (let i = 0; i < 36; i++) updatePlaying(G, 1 / 60, still);
-    // Pin the composed values the simulation may have nudged.
-    p.invulnT = 0; // staging set a long i-frame; its blink would hide the ship
-    p.hull = bossScene ? 56 : 78;
-    p.novaCharge = bossScene ? 1 : 0.65;
-    G.combo.chain = bossScene ? 2 : 3;
-    G.combo.timer = G.mods.comboWindow;
-    G.combo.best = bossScene ? 6 : 5;
-    G.stats.maxChain = G.combo.best;
-    G.aimX = still.aimX;
-    G.aimY = still.aimY;
-    G.banner = null;
-  } else if (name === 'win' || name === 'lose') {
-    startRun(false);
-    const won = name === 'win';
-    G.waveState.queue.length = 0;
-    G.enemies.length = 0;
-    G.banner = null;
-    G.score = won ? 61240 : 28410;
-    G.kills = won ? 148 : 86;
-    G.level = won ? 9 : 6;
-    G.wave = won ? 10 : 7;
-    G.runTime = won ? 512 : 388;
-    G.stats.captures = won ? 96 : 61;
-    G.stats.flings = won ? 210 : 132;
-    G.stats.novas = won ? 11 : 7;
-    G.stats.maxChain = won ? 8 : 6;
-    G.combo.best = G.stats.maxChain;
-    if (won) {
-      for (let i = 0; i < 5; i++) {
-        const rock = makeRock(0, 0);
-        G.orbit.push({
-          ang: (i / 5) * Math.PI * 2 + 0.4, dist: 50 + (i % 3) * 15,
-          r: rock.r, shade: rock.shade, t: 4, x: 0, y: 0,
+    // Stage the frozen frame for legibility: a full orbit of rocks, a live
+    // chain, and a busy arena — all from the game's own state.
+    while (state.player.rocks.length < state.stats.maxRocks) {
+      state.player.rocks.push({
+        angle: state.rng() * Math.PI * 2,
+        dist: 54 + state.player.rocks.length * 9,
+        size: 9,
+      });
+    }
+    state.chain = 6;
+    state.chainTimer = state.stats.chainWindow;
+    state.player.novaCd = 0;
+    const extraSpots = [
+      [220, 180, 'mote'], [1060, 160, 'wisp'], [980, 520, 'spitter'],
+      [180, 540, 'brute'], [640, 120, 'mote'], [1120, 380, 'wisp'],
+    ];
+    for (const [x, y, type] of extraSpots) {
+      if (state.enemies.length < 10) spawnEnemy(state, type, x, y, 1);
+    }
+  } else if (scene === 'boss') {
+    startRun(state);
+    startWave(state, 10);
+    applyUpgradeChoice(state, { id: 'nova-chain', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'frost-veil', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'railshot', path: 'pierce' });
+    applyUpgradeChoice(state, { id: 'overforge', path: 'forge' });
+    applyUpgradeChoice(state, { id: 'wisp-ally', path: 'forge' });
+    refreshBuild(state);
+    state.score = 9800;
+    state.kills = 167;
+    state.player.level = 9;
+    state.player.hp = 74;
+    // Force phase 2 so the shot shows the harder pattern set.
+    if (state.boss) state.boss.hp = state.boss.maxHp * 0.42;
+    for (let i = 0; i < 420; i++) {
+      autopilotTick(state, i);
+      frame(state, 1 / 60);
+      if (state.mode !== 'playing') break;
+    }
+    // Stage the dash telegraph for the frozen frame: the line is readable.
+    if (state.boss && state.mode === 'playing') {
+      state.boss.telegraph = 0.7;
+      state.boss.telegraphKind = 'dash';
+      state.boss.patternT = 5;
+      // Pull the ship clear of the boss so both read at a glance.
+      state.player.x = 640;
+      state.player.y = 540;
+      state.player.vx = 0;
+      state.player.vy = 0;
+      while (state.player.rocks.length < state.stats.maxRocks) {
+        state.player.rocks.push({
+          angle: state.rng() * Math.PI * 2,
+          dist: 54 + state.player.rocks.length * 9,
+          size: 9,
         });
       }
-      for (let i = 0; i < 6; i++) updateOrbit(G, 1 / 60);
-    } else {
-      G.player.dead = true;
-      G.enemies.push(...stageFoes([['chaser', 830, 250], ['dart', 380, 520], ['splitter', 950, 480]]));
+      state.player.novaCd = 0;
+      state.chain = 4;
+      state.chainTimer = state.stats.chainWindow;
     }
-    G.mode = won ? 'won' : 'lost';
+  } else if (scene === 'victory') {
+    startRun(state);
+    state.banner = null;
+    state.mode = 'victory';
+    state.wave = 10;
+    state.score = 12840;
+    state.kills = 243;
+    state.player.level = 12;
+    state.player.hp = 61;
+    state.chainBest = 14;
+    state.elapsed = 742;
+    applyUpgradeChoice(state, { id: 'nova-chain', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'ember-trail', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'chain-lightning', path: 'nova' });
+    applyUpgradeChoice(state, { id: 'deadeye', path: 'pierce' });
+    refreshBuild(state);
+    frame(state, 1 / 60);
   }
-  G.frozen = true;
+  state.frozen = true;
+  render(state);
   window.__shotReady = true;
 }
 
-// stageFoes(list) — build staged enemies from [kind, x, y] triples. Kept
-// as a tiny local helper so stageShot reads as composition, not plumbing.
-function stageFoes(list) {
-  return list.map(([kind, x, y]) => makeEnemy(kind, x, y, G.wave));
+function boot() {
+  const canvas = document.getElementById('game');
+  const state = createState(canvas);
+  // Debug handle for play-tests (read-only inspection from the console).
+  window.__starforge = state;
+  const params = new URLSearchParams(window.location.search);
+  const shot = params.get('shot');
+  if (shot) {
+    const seed = parseInt(params.get('seed') || '7', 10) || 7;
+    buildShotScene(state, shot, seed);
+    // Keep rendering the frozen frame (particles twinkle via time).
+    let last = performance.now();
+    const tick = (now) => {
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      state.time += dt;
+      render(state);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return;
+  }
+
+  let last = performance.now();
+  const loop = (now) => {
+    const dt = Math.min((now - last) / 1000, 1 / 30);
+    last = now;
+    frame(state, dt);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
 }
 
-// Boot: backdrop, input, the testing handle, then the opening state.
-initWorld(hasSeed ? seedParam : 20261);
-initInput(canvas, toWorld);
-window.__sfState = () => ({
-  mode: G.mode,
-  score: G.score,
-  wave: G.wave,
-  level: G.level,
-  kills: G.kills,
-  enemies: G.enemies.length,
-  orbit: G.orbit.length,
-  hull: Math.round(G.player.hull),
-});
-if (shotName) stageShot(shotName);
-else if (demoParam) startRun(true);
-else toTitle();
-
-// The frame loop: fixed-cap dt, frozen solid in shot mode.
-let last = performance.now();
-function frame(now) {
-  requestAnimationFrame(frame);
-  const dt = Math.min(0.033, Math.max(0.0005, (now - last) / 1000));
-  last = now;
-  if (!G.frozen) step(dt);
-  render();
-  endFrame();
-}
-requestAnimationFrame(frame);
+boot();

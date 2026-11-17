@@ -1,76 +1,97 @@
-// input.js — keyboard and mouse state for the game.
-// The rest of the game reads two plain objects: `keys` (held right now) and
-// `mouse` (arena coordinates + button). One-frame key presses are queued in
-// `edges` so the update loop can ask "was Enter just pressed?" exactly once.
+// input.js — Keyboard and mouse state for STARFORGE.
+//
+// One object owns the whole input picture: which movement keys are held,
+// where the mouse is (in canvas coordinates), and edge-triggered presses
+// (clicked this frame, pressed this frame) that the game loop consumes.
 
-export const keys = Object.create(null);
-export const mouse = { x: 640, y: 360, down: false, clicked: false };
+export class Input {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.keys = new Set();
+    this.pressed = new Set();
+    this.mouseX = 640;
+    this.mouseY = 360;
+    this.mouseDown = false;
+    this.mouseClicked = false;
+    this.anyGesture = false;
 
-const edges = new Set();
-const GAME_KEYS = new Set([
-  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space',
-  'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyE', 'ShiftLeft', 'ShiftRight',
-  'Enter', 'KeyR', 'KeyM', 'KeyP', 'Digit1', 'Digit2', 'Digit3',
-]);
+    window.addEventListener('keydown', (e) => {
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+        e.preventDefault();
+      }
+      if (!e.repeat) this.pressed.add(e.key.toLowerCase());
+      this.keys.add(e.key.toLowerCase());
+      this.anyGesture = true;
+    });
+    window.addEventListener('keyup', (e) => {
+      this.keys.delete(e.key.toLowerCase());
+    });
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this.mouseDown = false;
+    });
 
-// initInput(canvas, toWorld) — wire listeners. toWorld(clientX, clientY)
-// converts page coordinates into arena coordinates for the mouse.
-export function initInput(canvas, toWorld) {
-  window.addEventListener('keydown', (ev) => {
-    if (GAME_KEYS.has(ev.code)) ev.preventDefault();
-    if (!ev.repeat) edges.add(ev.code);
-    keys[ev.code] = true;
-  });
-  window.addEventListener('keyup', (ev) => {
-    keys[ev.code] = false;
-  });
-  window.addEventListener('blur', () => {
-    for (const k of Object.keys(keys)) keys[k] = false;
-    mouse.down = false;
-  });
-
-  canvas.addEventListener('mousemove', (ev) => {
-    const p = toWorld(ev.clientX, ev.clientY);
-    mouse.x = p.x;
-    mouse.y = p.y;
-  });
-  canvas.addEventListener('mousedown', (ev) => {
-    const p = toWorld(ev.clientX, ev.clientY);
-    mouse.x = p.x;
-    mouse.y = p.y;
-    mouse.down = true;
-    mouse.clicked = true;
-  });
-  window.addEventListener('mouseup', () => {
-    mouse.down = false;
-  });
-  canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
-}
-
-// pressed(code) — true only on the frame the key went down.
-export function pressed(code) {
-  return edges.has(code);
-}
-
-// endFrame() — clear one-frame signals; the main loop calls this last.
-export function endFrame() {
-  edges.clear();
-  mouse.clicked = false;
-}
-
-// moveVector() — the player's steering input as a normalised {x, y}:
-// WASD or arrow keys, diagonals already scaled to unit length.
-export function moveVector() {
-  let x = 0;
-  let y = 0;
-  if (keys.KeyA || keys.ArrowLeft) x -= 1;
-  if (keys.KeyD || keys.ArrowRight) x += 1;
-  if (keys.KeyW || keys.ArrowUp) y -= 1;
-  if (keys.KeyS || keys.ArrowDown) y += 1;
-  if (x !== 0 && y !== 0) {
-    const inv = Math.SQRT1_2;
-    x *= inv;
-    y *= inv;
+    const toCanvas = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      return {
+        x: (e.clientX - rect.left) * scaleX,
+        y: (e.clientY - rect.top) * scaleY,
+      };
+    };
+    canvas.addEventListener('mousemove', (e) => {
+      const p = toCanvas(e);
+      this.mouseX = p.x;
+      this.mouseY = p.y;
+    });
+    canvas.addEventListener('mousedown', (e) => {
+      const p = toCanvas(e);
+      this.mouseX = p.x;
+      this.mouseY = p.y;
+      this.mouseDown = true;
+      this.mouseClicked = true;
+      this.anyGesture = true;
+    });
+    window.addEventListener('mouseup', () => {
+      this.mouseDown = false;
+    });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   }
-  return { x, y };
+
+  // Held-down movement vector, normalised. WASD or arrow keys.
+  moveVector() {
+    let x = 0;
+    let y = 0;
+    if (this.keys.has('a') || this.keys.has('arrowleft')) x -= 1;
+    if (this.keys.has('d') || this.keys.has('arrowright')) x += 1;
+    if (this.keys.has('w') || this.keys.has('arrowup')) y -= 1;
+    if (this.keys.has('s') || this.keys.has('arrowdown')) y += 1;
+    if (x !== 0 && y !== 0) {
+      const inv = 1 / Math.hypot(x, y);
+      x *= inv;
+      y *= inv;
+    }
+    return { x, y };
+  }
+
+  // True only on the frame the key went down.
+  wasPressed(key) {
+    return this.pressed.has(key.toLowerCase());
+  }
+
+  isDown(key) {
+    return this.keys.has(key.toLowerCase());
+  }
+
+  // Aim angle from a point (px, py) toward the mouse.
+  aimAngle(px, py) {
+    return Math.atan2(this.mouseY - py, this.mouseX - px);
+  }
+
+  // Clear edge-triggered flags at the end of each frame.
+  endFrame() {
+    this.pressed.clear();
+    this.mouseClicked = false;
+  }
 }

@@ -15,3 +15,7 @@ node main.ts   # menyalin game/ + screenshots/ ke output dan menulis dossier.jso
 Buka `game/index.html` di browser desktop untuk bermain. Kontrol: WASD/panah bergerak, mouse membidik, klik/Spasi melempar batu, E/Shift NOVA, R mengulang.
 
 Daftar make.fun lewat referral kami: https://make.fun/r/1bdkx9mj
+
+## v4 — STARFORGE (2026-11-17)
+
+Rebuild penuh dari nol: draft 16 upgrade dalam 3 jalur build (NOVA / PIERCE / FORGE) dengan 6 sinergi bernama (PYROCHAIN, STORMFORGE, RAILSTORM, STARKEEPER, CRYO-NOVA, EMBERHEART), boss Devourer dua fase dengan telegraf serangan (radial, spiral, dash), dan NOVA CHAIN sebagai pengali skor. Screenshot diambil dari render game di Chromium headless (`?shot=title|play|boss|victory&seed=7`).
